@@ -12,6 +12,8 @@
     Slash,
     Type,
     ListOrdered,
+    Eraser,
+    StickyNote,
     Undo2,
     Redo2,
     Camera,
@@ -26,7 +28,7 @@
   } from "lucide-svelte";
 
   // Tool types
-  type Tool = "laser" | "pen" | "highlighter" | "arrow" | "rect" | "circle" | "line" | "stamp" | "text";
+  type Tool = "laser" | "pen" | "highlighter" | "arrow" | "rect" | "circle" | "line" | "stamp" | "text" | "eraser" | "sticky";
 
   interface Point {
     x: number;
@@ -90,6 +92,36 @@
   let textInput = $state("");
   let textInputRef = $state<HTMLInputElement | null>(null);
 
+  // Sticky Notes Interface & State
+  interface StickyNoteItem {
+    id: string;
+    x: number;
+    y: number;
+    width: number;
+    height: number;
+    content: string;
+    color: string;
+    headerColor: string;
+    textColor: string;
+    borderColor: string;
+    isCollapsed?: boolean;
+  }
+
+  const stickyColors = [
+    { name: "Canary Yellow", bg: "#FEF08A", header: "#FDE047", text: "#713F12", border: "#EAB308" },
+    { name: "Sakura Pink", bg: "#FBCFE8", header: "#F472B6", text: "#831843", border: "#EC4899" },
+    { name: "Mint Green", bg: "#BBF7D0", header: "#4ADE80", text: "#14532D", border: "#22C55E" },
+    { name: "Sky Blue", bg: "#BAE6FD", header: "#38BDF8", text: "#0C4A6E", border: "#0284C7" },
+    { name: "Lavender", bg: "#DDD6FE", header: "#A78BFA", text: "#4C1D95", border: "#8B5CF6" }
+  ];
+
+  let stickyNotes = $state<StickyNoteItem[]>([]);
+  let activeStickyDragId = $state<string | null>(null);
+  let stickyDragOffset = { x: 0, y: 0 };
+
+  // Eraser State
+  let eraserCursor = $state({ x: -100, y: -100, visible: false });
+
   // Settings / Help modal
   let showHelpModal = $state(false);
 
@@ -147,6 +179,15 @@
 
     window.addEventListener("resize", handleResize);
     window.addEventListener("keydown", handleKeyDown);
+
+    try {
+      const savedNotes = localStorage.getItem("pixeltrace_sticky_notes");
+      if (savedNotes) {
+        stickyNotes = JSON.parse(savedNotes);
+      }
+    } catch (e) {
+      console.warn("Could not load sticky notes:", e);
+    }
 
     let unlistenGhost: UnlistenFn | undefined;
     let unlistenClear: UnlistenFn | undefined;
@@ -419,7 +460,20 @@
   function onPointerDown(e: PointerEvent) {
     if (isGhostMode) return;
     const target = e.target as HTMLElement;
-    if (target && (target.closest(".widget-container") || target.closest(".inline-text-box") || target.closest(".modal-backdrop"))) return;
+    if (target && (target.closest(".widget-container") || target.closest(".inline-text-box") || target.closest(".modal-backdrop") || target.closest(".sticky-note"))) return;
+
+    if (currentTool === "sticky") {
+      addStickyNote(e.clientX, e.clientY);
+      isDrawing = false;
+      return;
+    }
+
+    if (currentTool === "eraser") {
+      isDrawing = true;
+      eraseAt(e.clientX, e.clientY);
+      renderEraserPreview();
+      return;
+    }
 
     if (currentTool === "text") {
       commitText();
@@ -482,6 +536,15 @@
       return;
     }
 
+    if (currentTool === "eraser") {
+      eraserCursor = { x: e.clientX, y: e.clientY, visible: true };
+      if (isDrawing) {
+        eraseAt(e.clientX, e.clientY);
+      }
+      renderEraserPreview();
+      return;
+    }
+
     if (!isDrawing) return;
 
     if (currentTool === "pen" || currentTool === "highlighter") {
@@ -506,6 +569,12 @@
     if (currentTool === "laser") {
       isDrawing = false;
       laserCursor = { x: e.clientX, y: e.clientY, visible: true, isPressed: false };
+      return;
+    }
+
+    if (currentTool === "eraser") {
+      isDrawing = false;
+      renderEraserPreview();
       return;
     }
 
@@ -553,6 +622,11 @@
     if (currentTool === "laser") {
       laserCursor.visible = false;
       isDrawing = false;
+    }
+    if (currentTool === "eraser") {
+      eraserCursor.visible = false;
+      isDrawing = false;
+      if (dynamicCtx) dynamicCtx.clearRect(0, 0, window.innerWidth, window.innerHeight);
     }
   }
 
@@ -708,6 +782,183 @@
     }
   }
 
+  // --- STICKY NOTES HELPER FUNCTIONS ---
+  function saveStickyNotes() {
+    try {
+      localStorage.setItem("pixeltrace_sticky_notes", JSON.stringify(stickyNotes));
+    } catch (e) {
+      console.warn("Failed to persist sticky notes:", e);
+    }
+  }
+
+  function addStickyNote(x: number, y: number) {
+    const defaultColor = stickyColors[stickyNotes.length % stickyColors.length];
+    const newNote: StickyNoteItem = {
+      id: crypto.randomUUID(),
+      x: Math.max(10, Math.min(window.innerWidth - 240, x - 100)),
+      y: Math.max(10, Math.min(window.innerHeight - 200, y - 20)),
+      width: 210,
+      height: 170,
+      content: "",
+      color: defaultColor.bg,
+      headerColor: defaultColor.header,
+      textColor: defaultColor.text,
+      borderColor: defaultColor.border,
+      isCollapsed: false
+    };
+    stickyNotes = [...stickyNotes, newNote];
+    saveStickyNotes();
+  }
+
+  function cycleStickyColor(id: string) {
+    stickyNotes = stickyNotes.map((note) => {
+      if (note.id !== id) return note;
+      const currIndex = stickyColors.findIndex((c) => c.bg === note.color);
+      const nextColor = stickyColors[(currIndex + 1) % stickyColors.length];
+      return {
+        ...note,
+        color: nextColor.bg,
+        headerColor: nextColor.header,
+        textColor: nextColor.text,
+        borderColor: nextColor.border
+      };
+    });
+    saveStickyNotes();
+  }
+
+  function toggleStickyCollapse(id: string) {
+    stickyNotes = stickyNotes.map((note) => {
+      if (note.id !== id) return note;
+      return { ...note, isCollapsed: !note.isCollapsed };
+    });
+    saveStickyNotes();
+  }
+
+  function deleteStickyNote(id: string) {
+    stickyNotes = stickyNotes.filter((n) => n.id !== id);
+    saveStickyNotes();
+  }
+
+  function startStickyDrag(e: MouseEvent, id: string) {
+    const note = stickyNotes.find((n) => n.id === id);
+    if (!note) return;
+    activeStickyDragId = id;
+    stickyDragOffset = {
+      x: e.clientX - note.x,
+      y: e.clientY - note.y
+    };
+    window.addEventListener("mousemove", onStickyDragMove);
+    window.addEventListener("mouseup", onStickyDragEnd);
+  }
+
+  function onStickyDragMove(e: MouseEvent) {
+    if (!activeStickyDragId) return;
+    const currentId = activeStickyDragId;
+    stickyNotes = stickyNotes.map((n) => {
+      if (n.id !== currentId) return n;
+      return {
+        ...n,
+        x: Math.max(0, Math.min(window.innerWidth - n.width, e.clientX - stickyDragOffset.x)),
+        y: Math.max(0, Math.min(window.innerHeight - 40, e.clientY - stickyDragOffset.y))
+      };
+    });
+  }
+
+  function onStickyDragEnd() {
+    activeStickyDragId = null;
+    window.removeEventListener("mousemove", onStickyDragMove);
+    window.removeEventListener("mouseup", onStickyDragEnd);
+    saveStickyNotes();
+  }
+
+  // --- ERASER ENGINE ---
+  function distToSegment(px: number, py: number, x1: number, y1: number, x2: number, y2: number) {
+    const l2 = (x2 - x1) ** 2 + (y2 - y1) ** 2;
+    if (l2 === 0) return Math.hypot(px - x1, py - y1);
+    let t = ((px - x1) * (x2 - x1) + (py - y1) * (y2 - y1)) / l2;
+    t = Math.max(0, Math.min(1, t));
+    return Math.hypot(px - (x1 + t * (x2 - x1)), py - (y1 + t * (y2 - y1)));
+  }
+
+  function eraseAt(x: number, y: number) {
+    const r = Math.max(14, currentSize * 3 + 12);
+    const toDeleteIds = new Set<string>();
+
+    for (const item of history) {
+      if ((item.tool === "pen" || item.tool === "highlighter") && item.points) {
+        for (let i = 0; i < item.points.length - 1; i++) {
+          const d = distToSegment(x, y, item.points[i].x, item.points[i].y, item.points[i + 1].x, item.points[i + 1].y);
+          if (d <= r + item.size / 2) {
+            toDeleteIds.add(item.id);
+            break;
+          }
+        }
+      } else if ((item.tool === "line" || item.tool === "arrow") && item.start && item.end) {
+        const d = distToSegment(x, y, item.start.x, item.start.y, item.end.x, item.end.y);
+        if (d <= r + item.size / 2) {
+          toDeleteIds.add(item.id);
+        }
+      } else if (item.tool === "rect" && item.start && item.end) {
+        const minX = Math.min(item.start.x, item.end.x);
+        const maxX = Math.max(item.start.x, item.end.x);
+        const minY = Math.min(item.start.y, item.end.y);
+        const maxY = Math.max(item.start.y, item.end.y);
+        const nearLeft = distToSegment(x, y, minX, minY, minX, maxY);
+        const nearRight = distToSegment(x, y, maxX, minY, maxX, maxY);
+        const nearTop = distToSegment(x, y, minX, minY, maxX, minY);
+        const nearBottom = distToSegment(x, y, minX, maxY, maxX, maxY);
+        if (Math.min(nearLeft, nearRight, nearTop, nearBottom) <= r + item.size / 2) {
+          toDeleteIds.add(item.id);
+        }
+      } else if (item.tool === "circle" && item.start && item.end) {
+        const rx = Math.abs(item.end.x - item.start.x) / 2;
+        const ry = Math.abs(item.end.y - item.start.y) / 2;
+        const cx = Math.min(item.start.x, item.end.x) + rx;
+        const cy = Math.min(item.start.y, item.end.y) + ry;
+        const distCenter = Math.hypot(x - cx, y - cy);
+        const avgR = (rx + ry) / 2;
+        if (Math.abs(distCenter - avgR) <= r + item.size / 2) {
+          toDeleteIds.add(item.id);
+        }
+      } else if (item.tool === "stamp" && item.start) {
+        if (Math.hypot(x - item.start.x, y - item.start.y) <= r + 18) {
+          toDeleteIds.add(item.id);
+        }
+      } else if (item.tool === "text" && item.textPoint) {
+        if (Math.hypot(x - item.textPoint.x, y - item.textPoint.y) <= r + 24) {
+          toDeleteIds.add(item.id);
+        }
+      }
+    }
+
+    if (toDeleteIds.size > 0) {
+      const deletedItems = history.filter((h) => toDeleteIds.has(h.id));
+      redoStack.push(...deletedItems);
+      history = history.filter((h) => !toDeleteIds.has(h.id));
+      redrawStaticCanvas();
+    }
+  }
+
+  function renderEraserPreview() {
+    if (!dynamicCtx || currentTool !== "eraser" || !eraserCursor.visible) return;
+    dynamicCtx.clearRect(0, 0, window.innerWidth, window.innerHeight);
+    const r = Math.max(14, currentSize * 3 + 12);
+
+    dynamicCtx.save();
+    dynamicCtx.beginPath();
+    dynamicCtx.arc(eraserCursor.x, eraserCursor.y, r, 0, Math.PI * 2);
+    dynamicCtx.fillStyle = "rgba(255, 255, 255, 0.22)";
+    dynamicCtx.fill();
+
+    dynamicCtx.beginPath();
+    dynamicCtx.arc(eraserCursor.x, eraserCursor.y, r, 0, Math.PI * 2);
+    dynamicCtx.strokeStyle = "rgba(255, 255, 255, 0.9)";
+    dynamicCtx.lineWidth = 1.8;
+    dynamicCtx.setLineDash([4, 4]);
+    dynamicCtx.stroke();
+    dynamicCtx.restore();
+  }
+
   // --- ACTIONS ---
   function undo() {
     if (history.length === 0) return;
@@ -834,9 +1085,11 @@
     if (key === "a" || key === "4") currentTool = "arrow";
     if (key === "r" || key === "5") currentTool = "rect";
     if (key === "c" || key === "6") currentTool = "circle";
-    if (key === "n" || key === "7") currentTool = "line";
+    if (key === "i" || key === "7") currentTool = "line";
     if (key === "s" || key === "8") currentTool = "stamp";
     if (key === "t" || key === "9") currentTool = "text";
+    if (key === "e" || key === "0") currentTool = "eraser";
+    if (key === "n") currentTool = "sticky";
 
     if (e.key === " ") {
       e.preventDefault();
@@ -916,6 +1169,72 @@
     <span>{ghostNotification}</span>
   </div>
 {/if}
+
+<!-- Interactive Draggable Physical Sticky Notes Layer -->
+{#each stickyNotes as note (note.id)}
+  <div
+    class="sticky-note"
+    class:collapsed={note.isCollapsed}
+    style="left: {note.x}px; top: {note.y}px; width: {note.width}px; background-color: {note.color}; border-color: {note.borderColor}; color: {note.textColor};"
+  >
+    <!-- Translucent Frosted Tape Pin at Top -->
+    <div class="sticky-tape"></div>
+
+    <!-- Note Header (Draggable) -->
+    <div
+      class="sticky-header"
+      style="background-color: {note.headerColor}; border-bottom-color: {note.borderColor};"
+      onmousedown={(e) => startStickyDrag(e, note.id)}
+      role="button"
+      tabindex="0"
+    >
+      <span class="sticky-title">Sticky Note</span>
+
+      <div class="sticky-actions">
+        <!-- Color Cycle Button -->
+        <button
+          class="sticky-action-btn"
+          onclick={() => cycleStickyColor(note.id)}
+          title="Change Note Color"
+          style="color: {note.textColor};"
+        >
+          🎨
+        </button>
+
+        <!-- Minimize / Fold Button -->
+        <button
+          class="sticky-action-btn"
+          onclick={() => toggleStickyCollapse(note.id)}
+          title={note.isCollapsed ? "Expand Note" : "Fold Note"}
+          style="color: {note.textColor};"
+        >
+          {note.isCollapsed ? "□" : "─"}
+        </button>
+
+        <!-- Delete Button -->
+        <button
+          class="sticky-action-btn close"
+          onclick={() => deleteStickyNote(note.id)}
+          title="Delete Note"
+          style="color: {note.textColor};"
+        >
+          ✕
+        </button>
+      </div>
+    </div>
+
+    <!-- Note Content -->
+    {#if !note.isCollapsed}
+      <textarea
+        class="sticky-body"
+        style="color: {note.textColor};"
+        placeholder="Write note here..."
+        bind:value={note.content}
+        oninput={saveStickyNotes}
+      ></textarea>
+    {/if}
+  </div>
+{/each}
 
 <!-- Floating Centered Toolbar -->
 <div
@@ -1021,7 +1340,7 @@
           class="tool-btn"
           class:active={currentTool === "line"}
           onclick={() => (currentTool = "line")}
-          title="Straight Line (N or 7)"
+          title="Straight Line (I or 7)"
         >
           <Slash size={16} />
         </button>
@@ -1049,6 +1368,26 @@
         >
           <ListOrdered size={16} />
           <span class="stamp-badge">{stampCounter}</span>
+        </button>
+
+        <!-- Eraser -->
+        <button
+          class="tool-btn"
+          class:active={currentTool === "eraser"}
+          onclick={() => (currentTool = "eraser")}
+          title="Eraser (E or 0) — Erase strokes & shapes"
+        >
+          <Eraser size={16} />
+        </button>
+
+        <!-- Sticky Note -->
+        <button
+          class="tool-btn"
+          class:active={currentTool === "sticky"}
+          onclick={() => (currentTool = "sticky")}
+          title="Sticky Note (N) — Click anywhere to post a physical sticky note"
+        >
+          <StickyNote size={16} />
         </button>
       </div>
 
@@ -1238,11 +1577,19 @@
         </div>
         <div class="shortcut-row">
           <span>Arrow / Rect / Circle / Line</span>
-          <kbd>A / R / C / N</kbd>
+          <kbd>A / R / C / I</kbd>
         </div>
         <div class="shortcut-row">
           <span>Numbered Stamp / Text Note</span>
           <kbd>S / T</kbd>
+        </div>
+        <div class="shortcut-row">
+          <span>Eraser Tool (Vector Erase)</span>
+          <kbd>E / 0</kbd>
+        </div>
+        <div class="shortcut-row">
+          <span>Sticky Note (Physical Note)</span>
+          <kbd>N</kbd>
         </div>
         <div class="shortcut-row">
           <span>Collapse / Expand Toolbar</span>
@@ -1284,7 +1631,8 @@
     z-index: 10;
   }
 
-  .canvas-layer.tool-laser {
+  .canvas-layer.tool-laser,
+  .canvas-layer.tool-eraser {
     cursor: none;
   }
 
@@ -1294,12 +1642,109 @@
   .canvas-layer.tool-rect,
   .canvas-layer.tool-circle,
   .canvas-layer.tool-line,
-  .canvas-layer.tool-stamp {
+  .canvas-layer.tool-stamp,
+  .canvas-layer.tool-sticky {
     cursor: crosshair;
   }
 
   .canvas-layer.tool-text {
     cursor: text;
+  }
+
+  /* Physical Skeuomorphic Sticky Notes */
+  .sticky-note {
+    position: fixed;
+    z-index: 100;
+    border-radius: 7px;
+    border-width: 1px;
+    border-style: solid;
+    box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.45), 0 8px 10px -6px rgba(0, 0, 0, 0.3);
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    user-select: none;
+    transition: box-shadow 0.2s ease, transform 0.15s ease;
+    pointer-events: auto;
+  }
+
+  .sticky-note:hover {
+    box-shadow: 0 16px 36px -4px rgba(0, 0, 0, 0.55), 0 10px 14px -5px rgba(0, 0, 0, 0.35);
+  }
+
+  .sticky-tape {
+    position: absolute;
+    top: -6px;
+    left: 50%;
+    transform: translateX(-50%);
+    width: 52px;
+    height: 16px;
+    background: rgba(255, 255, 255, 0.48);
+    backdrop-filter: blur(4px);
+    -webkit-backdrop-filter: blur(4px);
+    border: 1px solid rgba(255, 255, 255, 0.4);
+    box-shadow: 0 2px 4px rgba(0, 0, 0, 0.15);
+    border-radius: 2px;
+    z-index: 2;
+    pointer-events: none;
+  }
+
+  .sticky-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 8px 10px 6px 10px;
+    border-bottom-width: 1px;
+    border-bottom-style: solid;
+    cursor: grab;
+  }
+
+  .sticky-header:active {
+    cursor: grabbing;
+  }
+
+  .sticky-title {
+    font-size: 11px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.8px;
+    opacity: 0.85;
+  }
+
+  .sticky-actions {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+  }
+
+  .sticky-action-btn {
+    background: transparent;
+    border: none;
+    font-size: 11px;
+    cursor: pointer;
+    padding: 2px 5px;
+    border-radius: 4px;
+    opacity: 0.75;
+    transition: opacity 0.15s, background-color 0.15s;
+    line-height: 1;
+  }
+
+  .sticky-action-btn:hover {
+    opacity: 1;
+    background: rgba(0, 0, 0, 0.1);
+  }
+
+  .sticky-body {
+    width: 100%;
+    height: 135px;
+    background: transparent;
+    border: none;
+    outline: none;
+    padding: 10px 12px;
+    font-size: 13.5px;
+    line-height: 1.5;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    resize: both;
+    box-sizing: border-box;
   }
 
   /* Inline Text Box */
