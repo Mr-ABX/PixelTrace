@@ -18,10 +18,11 @@
         "transparent": true,
         "decorations": false,
         "alwaysOnTop": true,
-        "fullscreen": true,
+        "fullscreen": false,
         "resizable": true,
         "skipTaskbar": true,
-        "shadow": false
+        "shadow": false,
+        "visible": false
       }
     ],
     "security": {

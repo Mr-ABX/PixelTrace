@@ -1,6 +1,29 @@
 <script lang="ts">
   import { onMount, tick } from "svelte";
   import { invoke } from "@tauri-apps/api/core";
+  import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+  import {
+    Sparkles,
+    Pencil,
+    Highlighter,
+    ArrowUpRight,
+    Square,
+    Circle,
+    Slash,
+    Type,
+    ListOrdered,
+    Undo2,
+    Redo2,
+    Camera,
+    Hourglass,
+    Trash2,
+    Ghost,
+    Keyboard,
+    GripVertical,
+    Monitor,
+    ChevronLeft,
+    X
+  } from "lucide-svelte";
 
   // Tool types
   type Tool = "laser" | "pen" | "highlighter" | "arrow" | "rect" | "circle" | "line" | "stamp" | "text";
@@ -9,6 +32,12 @@
     x: number;
     y: number;
     time?: number;
+  }
+
+  interface LaserPoint {
+    x: number;
+    y: number;
+    time: number;
   }
 
   interface DrawItem {
@@ -38,8 +67,10 @@
   let currentTool = $state<Tool>("laser");
   let currentColor = $state("#FF3B30"); // Default neon red
   let currentSize = $state(4); // Default stroke size
-  let isGhostMode = $state(false); // Click-through
+  let isGhostMode = $state(false); // Click-through state
   let stampCounter = $state(1);
+  let ghostNotification = $state<string | null>(null);
+  let ghostNotifyTimer: number | null = null;
 
   // Auto-Fade Mode
   let autoFadeEnabled = $state(false);
@@ -73,18 +104,20 @@
   let startPoint = { x: 0, y: 0 };
   let currentStrokePoints: Point[] = [];
 
-  // Laser trail queue
-  let laserTrail: Point[] = [];
-  let laserRafId: number | null = null;
-  const LASER_DECAY_MS = 650;
+  // Continuous Laser Pointer Engine
+  let laserPoints: LaserPoint[] = [];
+  let laserAnimFrame: number | null = null;
+  let laserCursor = $state({ x: -100, y: -100, visible: false, isPressed: false });
+  const LASER_LIFETIME_MS = 850;
 
-  // Floating Widget state
-  let widgetX = $state(80);
-  let widgetY = $state(60);
+  // Floating Widget positioning & dragging
+  let toolbarRef = $state<HTMLDivElement | null>(null);
+  let widgetX = $state(100);
+  let widgetY = $state(20);
   let isDragging = false;
   let dragOffset = { x: 0, y: 0 };
   let isDocked = $state(false);
-  let dockEdge = $state<"left" | "right" | "top" | "bottom">("left");
+  let dockEdge = $state<"left" | "right" | "top" | "bottom">("top");
   let isCollapsed = $state(false);
 
   // Stroke Size Presets
@@ -95,37 +128,74 @@
     { label: "Heavy", val: 14 }
   ];
 
-  // Color Palette
+  // Curated MarkerOn / Excalidraw Color Palette
   const colors = [
     { name: "Neon Red", hex: "#FF3B30" },
-    { name: "Electric Yellow", hex: "#FFCC00" },
+    { name: "Electric Orange", hex: "#FF9500" },
+    { name: "Bright Yellow", hex: "#FFCC00" },
     { name: "Neon Green", hex: "#34C759" },
-    { name: "Cyan Blue", hex: "#00C7BE" },
-    { name: "Electric Purple", hex: "#AF52DE" },
+    { name: "Electric Cyan", hex: "#00C7BE" },
+    { name: "Apple Blue", hex: "#007AFF" },
+    { name: "Vivid Purple", hex: "#AF52DE" },
+    { name: "Jet Black", hex: "#1E293B" },
     { name: "Pure White", hex: "#FFFFFF" }
   ];
 
-  onMount(async () => {
+  onMount(() => {
     initCanvases();
+    centerToolbar();
+
     window.addEventListener("resize", handleResize);
     window.addEventListener("keydown", handleKeyDown);
 
-    // Fetch system monitors
-    try {
-      const res = await invoke<MonitorInfo[]>("get_monitors");
-      if (Array.isArray(res)) {
-        monitors = res;
+    let unlistenGhost: UnlistenFn | undefined;
+    let unlistenClear: UnlistenFn | undefined;
+
+    (async () => {
+      try {
+        const res = await invoke<MonitorInfo[]>("get_monitors");
+        if (Array.isArray(res)) {
+          monitors = res;
+        }
+      } catch (e) {
+        console.warn("Could not fetch monitors:", e);
       }
-    } catch (e) {
-      console.warn("Could not fetch monitors:", e);
-    }
+
+      try {
+        unlistenGhost = await listen<boolean>("ghost-mode-changed", (event) => {
+          isGhostMode = event.payload;
+          triggerGhostToast(isGhostMode);
+        });
+
+        unlistenClear = await listen("clear-canvas", () => {
+          clearCanvas();
+        });
+      } catch (e) {
+        console.warn("Could not attach event listeners:", e);
+      }
+    })();
 
     return () => {
       window.removeEventListener("resize", handleResize);
       window.removeEventListener("keydown", handleKeyDown);
-      if (laserRafId) cancelAnimationFrame(laserRafId);
+      if (laserAnimFrame) cancelAnimationFrame(laserAnimFrame);
+      if (unlistenGhost) unlistenGhost();
+      if (unlistenClear) unlistenClear();
     };
   });
+
+  function centerToolbar() {
+    tick().then(() => {
+      const width = toolbarRef ? toolbarRef.offsetWidth : 940;
+      widgetX = Math.max(16, Math.round((window.innerWidth - width) / 2));
+      widgetY = 20;
+    });
+  }
+
+  function handleResize() {
+    initCanvases();
+    centerToolbar();
+  }
 
   function initCanvases() {
     if (!staticCanvas || !dynamicCanvas) return;
@@ -147,82 +217,209 @@
     redrawStaticCanvas();
   }
 
-  function handleResize() {
-    initCanvases();
+  function triggerGhostToast(active: boolean) {
+    if (ghostNotifyTimer) clearTimeout(ghostNotifyTimer);
+    ghostNotification = active
+      ? "Ghost Mode Active — Clicks pass through to background apps (⌘⇧X / ⌘⇧G to return)"
+      : "Drawing Mode Active — Annotations enabled";
+    ghostNotifyTimer = window.setTimeout(() => {
+      ghostNotification = null;
+    }, 3200);
   }
 
-  // --- LASER POINTER ENGINE ---
-  function updateLaserTrail(x: number, y: number) {
-    const now = performance.now();
-    laserTrail.push({ x, y, time: now });
-    if (!laserRafId) {
-      laserRafId = requestAnimationFrame(renderLaserLoop);
-    }
-  }
-
+  // --- CONTINUOUS GLOWING LASER POINTER ENGINE ---
   function renderLaserLoop(now: number) {
     if (!dynamicCtx) return;
-    dynamicCtx.clearRect(0, 0, window.innerWidth, window.innerHeight);
 
-    // Filter points older than decay limit
-    laserTrail = laserTrail.filter((p) => now - (p.time || 0) < LASER_DECAY_MS);
+    // Prune expired laser points
+    laserPoints = laserPoints.filter((p) => now - p.time < LASER_LIFETIME_MS);
 
-    if (laserTrail.length > 0) {
-      for (let i = 0; i < laserTrail.length; i++) {
-        const p = laserTrail[i];
-        const age = now - (p.time || 0);
-        const progress = 1 - age / LASER_DECAY_MS;
+    // Only clear dynamicCtx if we are using the laser or if trail points remain
+    if (currentTool === "laser" || laserPoints.length > 0) {
+      dynamicCtx.clearRect(0, 0, window.innerWidth, window.innerHeight);
+    }
 
-        const radius = Math.max(2, (currentSize + 2) * progress);
+    // Render continuous tapered glowing beam trail
+    if (laserPoints.length >= 2) {
+      dynamicCtx.save();
+      dynamicCtx.lineCap = "round";
+      dynamicCtx.lineJoin = "round";
+
+      // Pass 1: Wide Neon Bloom with progressive alpha decay
+      for (let i = 0; i < laserPoints.length - 1; i++) {
+        const p0 = laserPoints[i];
+        const p1 = laserPoints[i + 1];
+        const age = now - p1.time;
+        const progress = Math.max(0, Math.min(1, 1 - age / LASER_LIFETIME_MS));
+        const width = Math.max(2, (currentSize * 3.6 + 6) * Math.pow(progress, 1.2));
+        const alpha = Math.pow(progress, 0.8) * 0.45;
+
         dynamicCtx.beginPath();
-        dynamicCtx.arc(p.x, p.y, radius, 0, Math.PI * 2);
-        dynamicCtx.fillStyle = `rgba(${hexToRgb(currentColor)}, ${progress * 0.85})`;
+        dynamicCtx.moveTo(p0.x, p0.y);
+        dynamicCtx.lineTo(p1.x, p1.y);
+        dynamicCtx.lineWidth = width;
+        dynamicCtx.strokeStyle = `rgba(${hexToRgb(currentColor)}, ${alpha})`;
         dynamicCtx.shadowColor = currentColor;
-        dynamicCtx.shadowBlur = 14 * progress;
-        dynamicCtx.fill();
+        dynamicCtx.shadowBlur = 16 * progress;
+        dynamicCtx.stroke();
       }
 
-      // Draw high-intensity glowing cursor head
-      const head = laserTrail[laserTrail.length - 1];
-      dynamicCtx.beginPath();
-      dynamicCtx.arc(head.x, head.y, currentSize + 4, 0, Math.PI * 2);
-      dynamicCtx.fillStyle = "#FFFFFF";
-      dynamicCtx.shadowColor = currentColor;
-      dynamicCtx.shadowBlur = 22;
-      dynamicCtx.fill();
+      // Pass 2: Saturated Neon Beam Core
+      for (let i = 0; i < laserPoints.length - 1; i++) {
+        const p0 = laserPoints[i];
+        const p1 = laserPoints[i + 1];
+        const age = now - p1.time;
+        const progress = Math.max(0, Math.min(1, 1 - age / LASER_LIFETIME_MS));
+        const width = Math.max(1.5, (currentSize * 1.6 + 2) * Math.pow(progress, 1.1));
+        const alpha = Math.pow(progress, 0.9) * 0.9;
 
-      dynamicCtx.beginPath();
-      dynamicCtx.arc(head.x, head.y, currentSize + 1, 0, Math.PI * 2);
-      dynamicCtx.fillStyle = currentColor;
-      dynamicCtx.fill();
+        dynamicCtx.beginPath();
+        dynamicCtx.moveTo(p0.x, p0.y);
+        dynamicCtx.lineTo(p1.x, p1.y);
+        dynamicCtx.lineWidth = width;
+        dynamicCtx.strokeStyle = `rgba(${hexToRgb(currentColor)}, ${alpha})`;
+        dynamicCtx.shadowColor = currentColor;
+        dynamicCtx.shadowBlur = 6 * progress;
+        dynamicCtx.stroke();
+      }
 
-      laserRafId = requestAnimationFrame(renderLaserLoop);
-    } else {
-      dynamicRafReset();
+      // Pass 3: White-Hot Center Spine
+      for (let i = 0; i < laserPoints.length - 1; i++) {
+        const p0 = laserPoints[i];
+        const p1 = laserPoints[i + 1];
+        const age = now - p1.time;
+        const progress = Math.max(0, Math.min(1, 1 - age / LASER_LIFETIME_MS));
+        const width = Math.max(1, (currentSize * 0.5 + 1) * Math.pow(progress, 1.3));
+        const alpha = Math.pow(progress, 1.1) * 0.95;
+
+        dynamicCtx.beginPath();
+        dynamicCtx.moveTo(p0.x, p0.y);
+        dynamicCtx.lineTo(p1.x, p1.y);
+        dynamicCtx.lineWidth = width;
+        dynamicCtx.strokeStyle = `rgba(255, 255, 255, ${alpha})`;
+        dynamicCtx.shadowBlur = 0;
+        dynamicCtx.stroke();
+      }
+
+      dynamicCtx.restore();
     }
-  }
 
-  function dynamicRafReset() {
-    laserRafId = null;
-    if (dynamicCtx && !isDrawing) {
-      dynamicCtx.clearRect(0, 0, window.innerWidth, window.innerHeight);
+    // Render Laser Pointer Head / Cursor Orb when tool is laser and cursor is visible
+    if (currentTool === "laser" && laserCursor.visible) {
+      dynamicCtx.save();
+      const headX = laserCursor.x;
+      const headY = laserCursor.y;
+      const pulse = Math.sin(now * 0.012) * 2;
+      const baseR = currentSize + 3;
+
+      // Outer Aura Ring
+      dynamicCtx.beginPath();
+      dynamicCtx.arc(headX, headY, baseR + 5 + pulse, 0, Math.PI * 2);
+      dynamicCtx.strokeStyle = `rgba(${hexToRgb(currentColor)}, 0.65)`;
+      dynamicCtx.lineWidth = 1.8;
+      dynamicCtx.shadowColor = currentColor;
+      dynamicCtx.shadowBlur = 14;
+      dynamicCtx.stroke();
+
+      // Glowing Center Orb
+      dynamicCtx.beginPath();
+      dynamicCtx.arc(headX, headY, baseR, 0, Math.PI * 2);
+      dynamicCtx.fillStyle = currentColor;
+      dynamicCtx.shadowColor = currentColor;
+      dynamicCtx.shadowBlur = 20;
+      dynamicCtx.fill();
+
+      // White Hot Spark
+      dynamicCtx.beginPath();
+      dynamicCtx.arc(headX, headY, Math.max(2, baseR * 0.42), 0, Math.PI * 2);
+      dynamicCtx.fillStyle = "#FFFFFF";
+      dynamicCtx.shadowColor = "#FFFFFF";
+      dynamicCtx.shadowBlur = 6;
+      dynamicCtx.fill();
+
+      dynamicCtx.restore();
+    }
+
+    // Continue loop while laser points decay or while laser tool is active with visible cursor
+    if (laserPoints.length > 0 || (currentTool === "laser" && laserCursor.visible)) {
+      laserAnimFrame = requestAnimationFrame(renderLaserLoop);
+    } else {
+      laserAnimFrame = null;
     }
   }
 
   function hexToRgb(hex: string): string {
     const clean = hex.replace("#", "");
     const bigint = parseInt(clean, 16);
+    if (isNaN(bigint)) return "255, 59, 48";
     const r = (bigint >> 16) & 255;
     const g = (bigint >> 8) & 255;
     const b = bigint & 255;
     return `${r}, ${g}, ${b}`;
   }
 
+  // --- SMOOTH FREEHAND DRAWING HELPER ---
+  function drawSmoothStroke(
+    ctx: CanvasRenderingContext2D,
+    points: Point[],
+    color: string,
+    size: number,
+    isHighlighter: boolean = false
+  ) {
+    if (!points || points.length === 0) return;
+
+    ctx.save();
+    ctx.lineCap = "round";
+    ctx.lineJoin = "round";
+
+    if (isHighlighter) {
+      ctx.strokeStyle = color;
+      ctx.lineWidth = size * 3.5;
+      ctx.globalAlpha = 0.35;
+      ctx.globalCompositeOperation = "source-over";
+    } else {
+      ctx.strokeStyle = color;
+      ctx.lineWidth = size;
+      ctx.globalAlpha = 1.0;
+    }
+
+    if (points.length === 1) {
+      // Clean single dot
+      ctx.beginPath();
+      ctx.arc(points[0].x, points[0].y, (isHighlighter ? size * 3.5 : size) / 2, 0, Math.PI * 2);
+      ctx.fillStyle = color;
+      ctx.fill();
+    } else if (points.length === 2) {
+      // Clean 2-point line
+      ctx.beginPath();
+      ctx.moveTo(points[0].x, points[0].y);
+      ctx.lineTo(points[1].x, points[1].y);
+      ctx.stroke();
+    } else {
+      // C1 continuous midpoint quadratic spline
+      ctx.beginPath();
+      ctx.moveTo(points[0].x, points[0].y);
+      ctx.lineTo((points[0].x + points[1].x) / 2, (points[0].y + points[1].y) / 2);
+
+      for (let i = 1; i < points.length - 1; i++) {
+        const midX = (points[i].x + points[i + 1].x) / 2;
+        const midY = (points[i].y + points[i + 1].y) / 2;
+        ctx.quadraticCurveTo(points[i].x, points[i].y, midX, midY);
+      }
+
+      const last = points[points.length - 1];
+      ctx.lineTo(last.x, last.y);
+      ctx.stroke();
+    }
+
+    ctx.restore();
+  }
+
   // --- MOUSE & DRAWING HANDLERS ---
   function onPointerDown(e: PointerEvent) {
     if (isGhostMode) return;
     const target = e.target as HTMLElement;
-    if (target && (target.closest(".widget-container") || target.closest(".inline-text-box"))) return;
+    if (target && (target.closest(".widget-container") || target.closest(".inline-text-box") || target.closest(".modal-backdrop"))) return;
 
     if (currentTool === "text") {
       commitText();
@@ -235,7 +432,6 @@
       return;
     }
 
-    // Commit any open text if user clicked away
     if (isTextActive) {
       commitText();
     }
@@ -244,9 +440,14 @@
     startPoint = { x: e.clientX, y: e.clientY };
 
     if (currentTool === "laser") {
-      updateLaserTrail(e.clientX, e.clientY);
+      laserCursor = { x: e.clientX, y: e.clientY, visible: true, isPressed: true };
+      laserPoints = [{ x: e.clientX, y: e.clientY, time: performance.now() }];
+      if (!laserAnimFrame) {
+        laserAnimFrame = requestAnimationFrame(renderLaserLoop);
+      }
     } else if (currentTool === "pen" || currentTool === "highlighter") {
       currentStrokePoints = [{ x: e.clientX, y: e.clientY }];
+      renderCurrentFreehand(dynamicCtx);
     } else if (currentTool === "stamp") {
       const stampItem: DrawItem = {
         id: crypto.randomUUID(),
@@ -264,32 +465,64 @@
   }
 
   function onPointerMove(e: PointerEvent) {
+    if (isGhostMode) return;
+
     if (currentTool === "laser") {
-      updateLaserTrail(e.clientX, e.clientY);
+      laserCursor = { x: e.clientX, y: e.clientY, visible: true, isPressed: isDrawing };
+      if (isDrawing) {
+        const now = performance.now();
+        const last = laserPoints[laserPoints.length - 1];
+        if (!last || Math.hypot(e.clientX - last.x, e.clientY - last.y) >= 2.5) {
+          laserPoints.push({ x: e.clientX, y: e.clientY, time: now });
+        }
+      }
+      if (!laserAnimFrame) {
+        laserAnimFrame = requestAnimationFrame(renderLaserLoop);
+      }
       return;
     }
 
-    if (!isDrawing || isGhostMode) return;
+    if (!isDrawing) return;
 
     if (currentTool === "pen" || currentTool === "highlighter") {
-      currentStrokePoints.push({ x: e.clientX, y: e.clientY });
-      renderCurrentFreehand(dynamicCtx);
+      const lastPt = currentStrokePoints[currentStrokePoints.length - 1];
+      if (lastPt) {
+        const dist = Math.hypot(e.clientX - lastPt.x, e.clientY - lastPt.y);
+        if (dist >= 2) {
+          const smoothX = lastPt.x * 0.2 + e.clientX * 0.8;
+          const smoothY = lastPt.y * 0.2 + e.clientY * 0.8;
+          currentStrokePoints.push({ x: smoothX, y: smoothY });
+          renderCurrentFreehand(dynamicCtx);
+        }
+      }
     } else if (["arrow", "rect", "circle", "line"].includes(currentTool)) {
       renderShapePreview(dynamicCtx, startPoint, { x: e.clientX, y: e.clientY }, currentTool);
     }
   }
 
   function onPointerUp(e: PointerEvent) {
-    if (!isDrawing || isGhostMode) return;
+    if (isGhostMode) return;
+
+    if (currentTool === "laser") {
+      isDrawing = false;
+      laserCursor = { x: e.clientX, y: e.clientY, visible: true, isPressed: false };
+      return;
+    }
+
+    if (!isDrawing) return;
     isDrawing = false;
 
     if (currentTool === "pen" || currentTool === "highlighter") {
       if (currentStrokePoints.length > 0) {
+        const last = currentStrokePoints[currentStrokePoints.length - 1];
+        if (Math.hypot(e.clientX - last.x, e.clientY - last.y) > 0.5) {
+          currentStrokePoints.push({ x: e.clientX, y: e.clientY });
+        }
         const item: DrawItem = {
           id: crypto.randomUUID(),
           tool: currentTool,
           color: currentColor,
-          size: currentTool === "highlighter" ? currentSize * 3.5 : currentSize,
+          size: currentSize,
           points: [...currentStrokePoints],
           createdAt: Date.now()
         };
@@ -300,7 +533,7 @@
     } else if (["arrow", "rect", "circle", "line"].includes(currentTool)) {
       const endPoint = { x: e.clientX, y: e.clientY };
       const dist = Math.hypot(endPoint.x - startPoint.x, endPoint.y - startPoint.y);
-      if (dist > 5) {
+      if (dist > 3) {
         const item: DrawItem = {
           id: crypto.randomUUID(),
           tool: currentTool,
@@ -316,12 +549,19 @@
     }
   }
 
+  function onPointerLeave() {
+    if (currentTool === "laser") {
+      laserCursor.visible = false;
+      isDrawing = false;
+    }
+  }
+
   function addItemToHistory(item: DrawItem) {
     history.push(item);
     redoStack = [];
     redrawStaticCanvas();
 
-    // Auto-fade timer if active
+    // Auto-fade timer if enabled
     if (autoFadeEnabled) {
       setTimeout(() => {
         history = history.filter((h) => h.id !== item.id);
@@ -336,7 +576,7 @@
         id: crypto.randomUUID(),
         tool: "text",
         color: currentColor,
-        size: Math.max(16, currentSize * 4),
+        size: Math.max(16, currentSize * 4.5),
         text: textInput.trim(),
         textPoint: { ...textPos },
         createdAt: Date.now()
@@ -355,31 +595,7 @@
   // --- VECTOR RENDERING ---
   function renderCurrentFreehand(ctx: CanvasRenderingContext2D) {
     ctx.clearRect(0, 0, window.innerWidth, window.innerHeight);
-    if (currentStrokePoints.length < 2) return;
-
-    ctx.save();
-    ctx.beginPath();
-    ctx.moveTo(currentStrokePoints[0].x, currentStrokePoints[0].y);
-
-    // Bézier curve smoothing for natural fluid strokes
-    for (let i = 1; i < currentStrokePoints.length - 1; i++) {
-      const xc = (currentStrokePoints[i].x + currentStrokePoints[i + 1].x) / 2;
-      const yc = (currentStrokePoints[i].y + currentStrokePoints[i + 1].y) / 2;
-      ctx.quadraticCurveTo(currentStrokePoints[i].x, currentStrokePoints[i].y, xc, yc);
-    }
-
-    ctx.strokeStyle = currentColor;
-    ctx.lineWidth = currentTool === "highlighter" ? currentSize * 3.5 : currentSize;
-    ctx.lineCap = "round";
-    ctx.lineJoin = "round";
-
-    if (currentTool === "highlighter") {
-      ctx.globalAlpha = 0.38;
-      ctx.globalCompositeOperation = "source-over";
-    }
-
-    ctx.stroke();
-    ctx.restore();
+    drawSmoothStroke(ctx, currentStrokePoints, currentColor, currentSize, currentTool === "highlighter");
   }
 
   function renderShapePreview(
@@ -414,7 +630,13 @@
       ctx.stroke();
     } else if (tool === "rect") {
       ctx.beginPath();
-      ctx.strokeRect(start.x, start.y, end.x - start.x, end.y - start.y);
+      const x = Math.min(start.x, end.x);
+      const y = Math.min(start.y, end.y);
+      const w = Math.abs(end.x - start.x);
+      const h = Math.abs(end.y - start.y);
+      const r = Math.min(8, w / 2, h / 2);
+      ctx.roundRect(x, y, w, h, r);
+      ctx.stroke();
     } else if (tool === "circle") {
       const radiusX = Math.abs(end.x - start.x) / 2;
       const radiusY = Math.abs(end.y - start.y) / 2;
@@ -424,11 +646,13 @@
       ctx.ellipse(centerX, centerY, radiusX, radiusY, 0, 0, Math.PI * 2);
       ctx.stroke();
     } else if (tool === "arrow") {
+      // Main arrow shaft
       ctx.beginPath();
       ctx.moveTo(start.x, start.y);
       ctx.lineTo(end.x, end.y);
       ctx.stroke();
 
+      // Sharp sleek arrowhead
       const angle = Math.atan2(end.y - start.y, end.x - start.x);
       const headLength = Math.max(16, size * 3.5);
 
@@ -453,22 +677,8 @@
 
     for (const item of history) {
       staticCtx.save();
-      if ((item.tool === "pen" || item.tool === "highlighter") && item.points && item.points.length > 1) {
-        staticCtx.beginPath();
-        staticCtx.moveTo(item.points[0].x, item.points[0].y);
-        for (let i = 1; i < item.points.length - 1; i++) {
-          const xc = (item.points[i].x + item.points[i + 1].x) / 2;
-          const yc = (item.points[i].y + item.points[i + 1].y) / 2;
-          staticCtx.quadraticCurveTo(item.points[i].x, item.points[i].y, xc, yc);
-        }
-        staticCtx.strokeStyle = item.color;
-        staticCtx.lineWidth = item.size;
-        staticCtx.lineCap = "round";
-        staticCtx.lineJoin = "round";
-        if (item.tool === "highlighter") {
-          staticCtx.globalAlpha = 0.38;
-        }
-        staticCtx.stroke();
+      if ((item.tool === "pen" || item.tool === "highlighter") && item.points) {
+        drawSmoothStroke(staticCtx, item.points, item.color, item.size, item.tool === "highlighter");
       } else if (item.start && item.end) {
         drawSingleShape(staticCtx, item.tool, item.start, item.end, item.color, item.size);
       } else if (item.tool === "stamp" && item.start && item.stampNumber) {
@@ -482,13 +692,12 @@
 
         staticCtx.shadowBlur = 0;
         staticCtx.fillStyle = "#FFFFFF";
-        staticCtx.font = "bold 15px -apple-system, BlinkMacSystemFont, sans-serif";
+        staticCtx.font = "bold 14px -apple-system, BlinkMacSystemFont, sans-serif";
         staticCtx.textAlign = "center";
         staticCtx.textBaseline = "middle";
         staticCtx.fillText(String(item.stampNumber), item.start.x, item.start.y + 1);
       } else if (item.tool === "text" && item.text && item.textPoint) {
         staticCtx.font = `bold ${item.size}px -apple-system, BlinkMacSystemFont, sans-serif`;
-        // Dark outline for legibility
         staticCtx.strokeStyle = "rgba(0, 0, 0, 0.85)";
         staticCtx.lineWidth = 4;
         staticCtx.strokeText(item.text, item.textPoint.x, item.textPoint.y);
@@ -524,27 +733,14 @@
   }
 
   async function toggleGhostMode() {
-    isGhostMode = !isGhostMode;
     try {
-      await invoke("set_click_through", { ignore: isGhostMode });
+      const newState = await invoke<boolean>("toggle_ghost_mode");
+      isGhostMode = newState;
+      triggerGhostToast(isGhostMode);
     } catch (err) {
-      console.error("Failed to toggle click through:", err);
-    }
-  }
-
-  async function onWidgetMouseEnter() {
-    if (isGhostMode) {
-      try {
-        await invoke("set_click_through", { ignore: false });
-      } catch (err) {}
-    }
-  }
-
-  async function onWidgetMouseLeave() {
-    if (isGhostMode) {
-      try {
-        await invoke("set_click_through", { ignore: true });
-      } catch (err) {}
+      isGhostMode = !isGhostMode;
+      await invoke("set_click_through", { ignore: isGhostMode });
+      triggerGhostToast(isGhostMode);
     }
   }
 
@@ -555,7 +751,7 @@
       staticCanvas.toBlob((blob) => {
         if (blob) {
           navigator.clipboard.write([new ClipboardItem({ "image/png": blob })])
-            .then(() => alert("✅ Annotated screenshot copied to clipboard!"))
+            .then(() => alert("Annotated screen markups copied to clipboard!"))
             .catch(() => {
               const a = document.createElement("a");
               a.href = staticCanvas.toDataURL("image/png");
@@ -581,12 +777,16 @@
         height: m.height
       });
       activeMonitorIndex = index;
+      setTimeout(() => {
+        initCanvases();
+        centerToolbar();
+      }, 80);
     } catch (e) {
       console.error("Failed to switch monitor:", e);
     }
   }
 
-  // --- SHORTCUTS ---
+  // --- KEYBOARD SHORTCUTS ---
   function handleKeyDown(e: KeyboardEvent) {
     if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) {
       if (e.key === "Enter") {
@@ -615,11 +815,15 @@
     }
 
     if (e.key === "Escape") {
+      if (showHelpModal) {
+        showHelpModal = false;
+        return;
+      }
       clearCanvas();
       return;
     }
 
-    if (key === "x") {
+    if (key === "x" || key === "g") {
       toggleGhostMode();
       return;
     }
@@ -630,8 +834,9 @@
     if (key === "a" || key === "4") currentTool = "arrow";
     if (key === "r" || key === "5") currentTool = "rect";
     if (key === "c" || key === "6") currentTool = "circle";
-    if (key === "s" || key === "7") currentTool = "stamp";
-    if (key === "t" || key === "8") currentTool = "text";
+    if (key === "n" || key === "7") currentTool = "line";
+    if (key === "s" || key === "8") currentTool = "stamp";
+    if (key === "t" || key === "9") currentTool = "text";
 
     if (e.key === " ") {
       e.preventDefault();
@@ -639,7 +844,7 @@
     }
   }
 
-  // --- FLOATING WIDGET DRAGGING & DOCKING ---
+  // --- FLOATING TOOLBAR DRAGGING ---
   function onDragStart(e: MouseEvent) {
     isDragging = true;
     dragOffset = {
@@ -661,29 +866,15 @@
     window.removeEventListener("mousemove", onDragMove);
     window.removeEventListener("mouseup", onDragEnd);
 
-    const threshold = 50;
     const w = window.innerWidth;
     const h = window.innerHeight;
+    const barWidth = toolbarRef ? toolbarRef.offsetWidth : 940;
+    const barHeight = toolbarRef ? toolbarRef.offsetHeight : 54;
 
-    if (widgetX < threshold) {
-      widgetX = 12;
-      isDocked = true;
-      dockEdge = "left";
-    } else if (widgetX > w - 620 - threshold) {
-      widgetX = w - 630;
-      isDocked = true;
-      dockEdge = "right";
-    } else if (widgetY < threshold) {
-      widgetY = 12;
-      isDocked = true;
-      dockEdge = "top";
-    } else if (widgetY > h - 70 - threshold) {
-      widgetY = h - 70;
-      isDocked = true;
-      dockEdge = "bottom";
-    } else {
-      isDocked = false;
-    }
+    widgetX = Math.max(12, Math.min(w - barWidth - 12, widgetX));
+    widgetY = Math.max(12, Math.min(h - barHeight - 12, widgetY));
+
+    isDocked = widgetY <= 16;
   }
 </script>
 
@@ -695,51 +886,59 @@
 
 <canvas
   bind:this={dynamicCanvas}
-  class="canvas-layer"
+  class="canvas-layer tool-{currentTool}"
   onpointerdown={onPointerDown}
   onpointermove={onPointerMove}
   onpointerup={onPointerUp}
+  onpointerleave={onPointerLeave}
 ></canvas>
 
 <!-- Inline Editable Text Box -->
 {#if isTextActive}
   <div
     class="inline-text-box"
-    style="left: {textPos.x}px; top: {textPos.y - 20}px;"
+    style="left: {textPos.x}px; top: {textPos.y - 24}px;"
   >
     <input
       bind:this={textInputRef}
       bind:value={textInput}
-      style="color: {currentColor}; font-size: {Math.max(16, currentSize * 4)}px;"
-      placeholder="Type note and press Enter..."
+      style="color: {currentColor}; font-size: {Math.max(16, currentSize * 4.5)}px;"
+      placeholder="Type annotation and press Enter..."
     />
-    <div class="text-hint">Press Enter to place, Esc to cancel</div>
+    <div class="text-hint">Enter to place • Esc to cancel</div>
   </div>
 {/if}
 
-<!-- Floating Edge-Docking Widget Container -->
+<!-- Ghost Mode Toast Notification -->
+{#if ghostNotification}
+  <div class="ghost-toast" class:active={isGhostMode}>
+    <Ghost size={16} />
+    <span>{ghostNotification}</span>
+  </div>
+{/if}
+
+<!-- Floating Centered Toolbar -->
 <div
+  bind:this={toolbarRef}
   class="widget-container"
   class:docked={isDocked}
   class:collapsed={isCollapsed}
   style="transform: translate({widgetX}px, {widgetY}px);"
   role="region"
-  aria-label="PixelTrace Controls"
-  onmouseenter={onWidgetMouseEnter}
-  onmouseleave={onWidgetMouseLeave}
+  aria-label="PixelTrace Screen Toolbar"
 >
   {#if isCollapsed}
-    <!-- Collapsed Edge Pill (Tab) -->
+    <!-- Collapsed Edge Pill -->
     <button
       class="edge-pill"
       onclick={() => (isCollapsed = false)}
       title="Expand PixelTrace Toolbar (Space)"
     >
-      <span class="pill-glow" style="background-color: {currentColor}"></span>
-      <span class="pill-label">PT</span>
+      <span class="pill-dot" style="background-color: {currentColor}"></span>
+      <span class="pill-text">PixelTrace</span>
     </button>
   {:else}
-    <!-- Expanded Floating Glassmorphic Toolbar -->
+    <!-- Full Modern Glassmorphic Toolbar -->
     <div class="glass-bar">
       <!-- Drag Handle -->
       <div
@@ -747,16 +946,9 @@
         onmousedown={onDragStart}
         role="button"
         tabindex="0"
-        title="Drag toolbar anywhere (Snap to edges)"
+        title="Drag toolbar anywhere"
       >
-        <svg width="14" height="20" viewBox="0 0 14 20" fill="currentColor">
-          <circle cx="4" cy="4" r="1.5" />
-          <circle cx="10" cy="4" r="1.5" />
-          <circle cx="4" cy="10" r="1.5" />
-          <circle cx="10" cy="10" r="1.5" />
-          <circle cx="4" cy="16" r="1.5" />
-          <circle cx="10" cy="16" r="1.5" />
-        </svg>
+        <GripVertical size={16} />
       </div>
 
       <div class="divider"></div>
@@ -768,10 +960,10 @@
           class="tool-btn"
           class:active={currentTool === "laser"}
           onclick={() => (currentTool = "laser")}
-          title="Laser Pointer (L or 1) — Decaying trail"
+          title="Laser Pointer (L or 1) — Continuous glowing trail"
         >
-          <span class="laser-dot" style="background-color: {currentColor}"></span>
-          <span class="label">Laser</span>
+          <Sparkles size={17} />
+          <span class="laser-indicator" style="background-color: {currentColor}"></span>
         </button>
 
         <!-- Pen -->
@@ -781,7 +973,7 @@
           onclick={() => (currentTool = "pen")}
           title="Smooth Pen (P or 2)"
         >
-          ✏️
+          <Pencil size={17} />
         </button>
 
         <!-- Highlighter -->
@@ -791,7 +983,7 @@
           onclick={() => (currentTool = "highlighter")}
           title="Highlighter (H or 3)"
         >
-          🖍️
+          <Highlighter size={17} />
         </button>
 
         <!-- Arrow -->
@@ -801,7 +993,7 @@
           onclick={() => (currentTool = "arrow")}
           title="Arrow (A or 4)"
         >
-          ↗️
+          <ArrowUpRight size={18} />
         </button>
 
         <!-- Rectangle -->
@@ -811,7 +1003,7 @@
           onclick={() => (currentTool = "rect")}
           title="Rectangle (R or 5)"
         >
-          🔲
+          <Square size={16} />
         </button>
 
         <!-- Circle -->
@@ -821,17 +1013,27 @@
           onclick={() => (currentTool = "circle")}
           title="Circle (C or 6)"
         >
-          ⭕
+          <Circle size={16} />
         </button>
 
-        <!-- Text Tool -->
+        <!-- Line -->
+        <button
+          class="tool-btn"
+          class:active={currentTool === "line"}
+          onclick={() => (currentTool = "line")}
+          title="Straight Line (N or 7)"
+        >
+          <Slash size={16} />
+        </button>
+
+        <!-- Text -->
         <button
           class="tool-btn"
           class:active={currentTool === "text"}
           onclick={() => (currentTool = "text")}
-          title="Text Note (T or 8) — Click anywhere to type"
+          title="Text Note (T or 9) — Click anywhere to write"
         >
-          🔤
+          <Type size={17} />
         </button>
 
         <!-- Numbered Stamp -->
@@ -843,8 +1045,9 @@
             e.preventDefault();
             stampCounter = 1;
           }}
-          title="Numbered Stamp (S or 7). Right-click to reset #{stampCounter}"
+          title="Numbered Stamp (S or 8). Right-click to reset #{stampCounter}"
         >
+          <ListOrdered size={16} />
           <span class="stamp-badge">{stampCounter}</span>
         </button>
       </div>
@@ -882,51 +1085,49 @@
 
       <div class="divider"></div>
 
-      <!-- Undo, Redo, Snapshot, Clear -->
+      <!-- Actions Group -->
       <div class="btn-group">
         <button
           class="icon-btn"
           disabled={history.length === 0}
           onclick={undo}
-          title="Undo (Ctrl/Cmd+Z)"
+          title="Undo (⌘Z)"
         >
-          ↩️
+          <Undo2 size={16} />
         </button>
 
         <button
           class="icon-btn"
           disabled={redoStack.length === 0}
           onclick={redo}
-          title="Redo (Ctrl/Cmd+Y)"
+          title="Redo (⌘⇧Z / ⌘Y)"
         >
-          ↪️
+          <Redo2 size={16} />
         </button>
 
-        <!-- Capture Snapshot -->
         <button
           class="icon-btn"
           onclick={captureSnapshot}
           title="Copy Screenshot to Clipboard"
         >
-          📸
+          <Camera size={16} />
         </button>
 
-        <!-- Auto Fade Toggle -->
         <button
           class="icon-btn"
           class:active={autoFadeEnabled}
           onclick={() => (autoFadeEnabled = !autoFadeEnabled)}
-          title="Auto-Fade Strokes (3.5s): {autoFadeEnabled ? 'ON' : 'OFF'}"
+          title="Auto-Fade Markups (3.5s): {autoFadeEnabled ? 'ON' : 'OFF'}"
         >
-          ⏳
+          <Hourglass size={16} />
         </button>
 
         <button
           class="icon-btn danger"
           onclick={clearCanvas}
-          title="Clear Screen (Esc)"
+          title="Clear Screen Markups (Esc)"
         >
-          🗑️
+          <Trash2 size={16} />
         </button>
       </div>
 
@@ -942,71 +1143,105 @@
               onclick={() => switchToMonitor(idx)}
               title="Switch overlay to Monitor {idx + 1}"
             >
-              🖥️ {idx + 1}
+              <Monitor size={12} />
+              <span>{idx + 1}</span>
             </button>
           {/each}
         </div>
         <div class="divider"></div>
       {/if}
 
-      <!-- Ghost Mode (Click-Through) -->
+      <!-- Ghost Mode (Click-Through) Button -->
       <button
         class="ghost-btn"
         class:active={isGhostMode}
         onclick={toggleGhostMode}
-        title="Ghost Mode (X) — Pass clicks through to apps below"
+        title="Ghost Mode (⌘⇧X / ⌘⇧G / X) — Pass clicks through to background apps"
       >
-        {isGhostMode ? "👻 Ghost" : "👁️ Draw"}
+        <Ghost size={15} />
+        <span class="ghost-label">{isGhostMode ? "Ghost" : "Draw"}</span>
       </button>
 
-      <!-- Settings / Info Button -->
+      <!-- Keyboard Shortcuts / Help Button -->
       <button
         class="icon-btn"
         onclick={() => (showHelpModal = !showHelpModal)}
         title="Keyboard Shortcuts & About"
       >
-        ⚙️
+        <Keyboard size={16} />
       </button>
 
-      <!-- Collapse / Dock Button -->
+      <!-- Collapse Button -->
       <button
         class="collapse-btn"
         onclick={() => (isCollapsed = true)}
-        title="Collapse into edge drawer tab (Space)"
+        title="Collapse into edge pill (Space)"
       >
-        ◀
+        <ChevronLeft size={16} />
       </button>
     </div>
   {/if}
 </div>
 
-<!-- Shortcuts & Info Modal -->
+<!-- Shortcuts Modal -->
 {#if showHelpModal}
-  <div class="modal-backdrop" onclick={() => (showHelpModal = false)}>
-    <div class="modal-card" onclick={(e) => e.stopPropagation()}>
+  <div
+    class="modal-backdrop"
+    role="dialog"
+    aria-modal="true"
+    tabindex="0"
+    onclick={(e) => {
+      if (e.target === e.currentTarget) showHelpModal = false;
+    }}
+    onkeydown={(e) => {
+      if (e.key === "Escape") showHelpModal = false;
+    }}
+  >
+    <div
+      class="modal-card"
+      role="document"
+    >
       <div class="modal-header">
-        <h3>⚡ PixelTrace Quick Shortcuts</h3>
-        <button class="modal-close" onclick={() => (showHelpModal = false)}>✕</button>
+        <div class="modal-title">
+          <Sparkles size={18} />
+          <h3>PixelTrace Shortcuts</h3>
+        </div>
+        <button
+          class="modal-close"
+          onclick={() => (showHelpModal = false)}
+          aria-label="Close dialog"
+        >
+          <X size={16} />
+        </button>
       </div>
+
       <div class="modal-body">
         <div class="shortcut-row">
-          <span>Toggle Overlay (Global)</span>
+          <span>Toggle Overlay Visibility (Hide/Show)</span>
           <kbd>⌘ + Shift + D</kbd>
         </div>
         <div class="shortcut-row">
-          <span>Ghost / Click-Through Mode</span>
-          <kbd>X</kbd>
+          <span>Toggle Ghost Mode (Global Passthrough)</span>
+          <kbd>⌘ + Shift + X / ⌘⇧G</kbd>
         </div>
         <div class="shortcut-row">
-          <span>Laser / Pen / Highlighter</span>
-          <kbd>L / P / H</kbd>
+          <span>Ghost Mode Quick Toggle (when focused)</span>
+          <kbd>X / G</kbd>
+        </div>
+        <div class="shortcut-row">
+          <span>Laser Pointer (Continuous Trail)</span>
+          <kbd>L / 1</kbd>
+        </div>
+        <div class="shortcut-row">
+          <span>Smooth Pen / Highlighter</span>
+          <kbd>P / H</kbd>
         </div>
         <div class="shortcut-row">
           <span>Arrow / Rect / Circle / Line</span>
-          <kbd>A / R / C</kbd>
+          <kbd>A / R / C / N</kbd>
         </div>
         <div class="shortcut-row">
-          <span>Numbered Stamp / Text</span>
+          <span>Numbered Stamp / Text Note</span>
           <kbd>S / T</kbd>
         </div>
         <div class="shortcut-row">
@@ -1018,7 +1253,7 @@
           <kbd>⌘Z / ⌘⇧Z</kbd>
         </div>
         <div class="shortcut-row">
-          <span>Clear All Markups</span>
+          <span>Clear All Screen Markups</span>
           <kbd>Esc</kbd>
         </div>
       </div>
@@ -1036,6 +1271,7 @@
     background: transparent !important;
     user-select: none;
     -webkit-user-select: none;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
   }
 
   .canvas-layer {
@@ -1048,6 +1284,24 @@
     z-index: 10;
   }
 
+  .canvas-layer.tool-laser {
+    cursor: none;
+  }
+
+  .canvas-layer.tool-pen,
+  .canvas-layer.tool-highlighter,
+  .canvas-layer.tool-arrow,
+  .canvas-layer.tool-rect,
+  .canvas-layer.tool-circle,
+  .canvas-layer.tool-line,
+  .canvas-layer.tool-stamp {
+    cursor: crosshair;
+  }
+
+  .canvas-layer.tool-text {
+    cursor: text;
+  }
+
   /* Inline Text Box */
   .inline-text-box {
     position: fixed;
@@ -1055,28 +1309,70 @@
     display: flex;
     flex-direction: column;
     gap: 4px;
-    background: rgba(15, 15, 18, 0.85);
-    backdrop-filter: blur(16px);
+    background: rgba(18, 18, 24, 0.88);
+    backdrop-filter: blur(20px);
+    -webkit-backdrop-filter: blur(20px);
     border: 1px solid rgba(255, 255, 255, 0.2);
-    border-radius: 8px;
-    padding: 6px 10px;
-    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
+    border-radius: 9px;
+    padding: 6px 12px;
+    box-shadow: 0 10px 30px rgba(0, 0, 0, 0.55);
   }
 
   .inline-text-box input {
     background: transparent;
     border: none;
     outline: none;
-    font-weight: bold;
-    min-width: 220px;
+    font-weight: 700;
+    min-width: 240px;
   }
 
   .text-hint {
-    font-size: 10px;
-    color: rgba(255, 255, 255, 0.5);
+    font-size: 11px;
+    color: rgba(255, 255, 255, 0.55);
   }
 
-  /* Floating Glassmorphic Container */
+  /* Ghost Mode Toast */
+  .ghost-toast {
+    position: fixed;
+    bottom: 24px;
+    left: 50%;
+    transform: translateX(-50%);
+    z-index: 9999999;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 16px;
+    background: rgba(24, 24, 30, 0.92);
+    backdrop-filter: blur(24px);
+    -webkit-backdrop-filter: blur(24px);
+    border: 1px solid rgba(255, 255, 255, 0.16);
+    border-radius: 20px;
+    color: #f0f0f5;
+    font-size: 12px;
+    font-weight: 600;
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
+    pointer-events: none;
+    animation: toast-in 0.2s ease-out;
+  }
+
+  .ghost-toast.active {
+    background: rgba(142, 68, 173, 0.88);
+    border-color: rgba(255, 255, 255, 0.3);
+    box-shadow: 0 8px 28px rgba(142, 68, 173, 0.5);
+  }
+
+  @keyframes toast-in {
+    from {
+      opacity: 0;
+      transform: translate(-50%, 12px);
+    }
+    to {
+      opacity: 1;
+      transform: translate(-50%, 0);
+    }
+  }
+
+  /* Floating Centered Toolbar Container */
   .widget-container {
     position: fixed;
     top: 0;
@@ -1084,60 +1380,61 @@
     z-index: 999999;
     pointer-events: auto;
     transition: transform 0.08s ease-out;
-    filter: drop-shadow(0 14px 32px rgba(0, 0, 0, 0.5));
+    filter: drop-shadow(0 14px 36px rgba(0, 0, 0, 0.5));
   }
 
   .widget-container.collapsed {
     transition: transform 0.25s cubic-bezier(0.16, 1, 0.3, 1);
   }
 
-  /* Sleek Collapsed Edge Pill */
+  /* Sleek Collapsed Pill */
   .edge-pill {
     display: flex;
     align-items: center;
-    gap: 6px;
-    padding: 8px 14px;
-    background: rgba(18, 18, 22, 0.88);
-    backdrop-filter: blur(20px);
-    -webkit-backdrop-filter: blur(20px);
+    gap: 8px;
+    padding: 8px 16px;
+    background: rgba(20, 20, 26, 0.92);
+    backdrop-filter: blur(24px);
+    -webkit-backdrop-filter: blur(24px);
     border: 1px solid rgba(255, 255, 255, 0.16);
     border-radius: 24px;
     color: #ffffff;
     cursor: pointer;
-    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
     transition: transform 0.15s ease, background-color 0.15s;
   }
 
   .edge-pill:hover {
-    transform: scale(1.06);
-    background: rgba(28, 28, 34, 0.95);
+    transform: scale(1.05);
+    background: rgba(28, 28, 36, 0.96);
   }
 
-  .pill-glow {
-    width: 8px;
-    height: 8px;
+  .pill-dot {
+    width: 9px;
+    height: 9px;
     border-radius: 50%;
     box-shadow: 0 0 10px currentColor;
   }
 
-  .pill-label {
+  .pill-text {
     font-size: 13px;
     font-weight: 700;
-    letter-spacing: 0.5px;
+    letter-spacing: 0.4px;
   }
 
-  /* Glassmorphic Full Toolbar */
+  /* Modern MarkerOn-Style Glassmorphic Bar */
   .glass-bar {
     display: flex;
     align-items: center;
-    gap: 6px;
+    gap: 5px;
     padding: 6px 10px;
-    background: rgba(20, 20, 24, 0.84);
-    backdrop-filter: blur(26px) saturate(190%);
-    -webkit-backdrop-filter: blur(26px) saturate(190%);
-    border: 1px solid rgba(255, 255, 255, 0.15);
+    background: rgba(22, 22, 28, 0.92);
+    backdrop-filter: blur(28px) saturate(190%);
+    -webkit-backdrop-filter: blur(28px) saturate(190%);
+    border: 1px solid rgba(255, 255, 255, 0.12);
     border-radius: 16px;
-    color: #ececed;
+    color: #e5e5ea;
+    box-shadow: 0 12px 32px rgba(0, 0, 0, 0.45);
   }
 
   .drag-handle {
@@ -1157,7 +1454,7 @@
     width: 1px;
     height: 22px;
     background: rgba(255, 255, 255, 0.12);
-    margin: 0 2px;
+    margin: 0 3px;
   }
 
   .btn-group {
@@ -1167,51 +1464,59 @@
   }
 
   .tool-btn {
+    position: relative;
     display: flex;
     align-items: center;
-    gap: 5px;
-    padding: 6px 8px;
+    justify-content: center;
+    width: 34px;
+    height: 34px;
     background: transparent;
     border: 1px solid transparent;
     border-radius: 9px;
-    color: #e0e0e0;
-    font-size: 14px;
+    color: rgba(255, 255, 255, 0.75);
     cursor: pointer;
-    transition: background 0.15s, border-color 0.15s;
+    transition: all 0.15s ease;
   }
 
   .tool-btn:hover {
     background: rgba(255, 255, 255, 0.08);
+    color: #ffffff;
   }
 
   .tool-btn.active {
-    background: rgba(255, 255, 255, 0.16);
+    background: rgba(255, 255, 255, 0.18);
     border-color: rgba(255, 255, 255, 0.28);
     color: #ffffff;
-    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.35);
   }
 
-  .laser-dot {
-    width: 8px;
-    height: 8px;
+  .laser-indicator {
+    position: absolute;
+    bottom: 4px;
+    right: 4px;
+    width: 6px;
+    height: 6px;
     border-radius: 50%;
-    box-shadow: 0 0 8px currentColor;
+    box-shadow: 0 0 6px currentColor;
   }
 
   .stamp-btn {
-    padding: 4px 6px;
+    position: relative;
   }
 
   .stamp-badge {
+    position: absolute;
+    top: 2px;
+    right: 2px;
     display: inline-flex;
     align-items: center;
     justify-content: center;
-    width: 20px;
-    height: 20px;
+    width: 14px;
+    height: 14px;
     background: #007aff;
     color: white;
-    font-weight: bold;
-    font-size: 11px;
+    font-weight: 700;
+    font-size: 9px;
     border-radius: 50%;
   }
 
@@ -1223,14 +1528,14 @@
   }
 
   .size-chip {
-    width: 20px;
-    height: 20px;
+    width: 22px;
+    height: 22px;
     display: flex;
     align-items: center;
     justify-content: center;
     background: transparent;
     border: 1px solid transparent;
-    border-radius: 4px;
+    border-radius: 5px;
     cursor: pointer;
     padding: 0;
   }
@@ -1240,8 +1545,8 @@
   }
 
   .size-chip.active {
-    border-color: rgba(255, 255, 255, 0.4);
-    background: rgba(255, 255, 255, 0.14);
+    border-color: rgba(255, 255, 255, 0.45);
+    background: rgba(255, 255, 255, 0.16);
   }
 
   .size-dot {
@@ -1249,7 +1554,7 @@
     border-radius: 50%;
   }
 
-  /* Color Palette Chips */
+  /* Color Palette */
   .color-palette {
     display: flex;
     align-items: center;
@@ -1263,7 +1568,7 @@
     border: 2px solid transparent;
     cursor: pointer;
     padding: 0;
-    transition: transform 0.15s, border-color 0.15s;
+    transition: transform 0.15s, border-color 0.15s, box-shadow 0.15s;
   }
 
   .color-chip:hover {
@@ -1271,29 +1576,35 @@
   }
 
   .color-chip.active {
-    transform: scale(1.25);
+    transform: scale(1.22);
     border-color: #ffffff;
-    box-shadow: 0 0 10px rgba(255, 255, 255, 0.6);
+    box-shadow: 0 0 10px rgba(255, 255, 255, 0.7);
   }
 
+  /* Icon Buttons */
   .icon-btn {
-    padding: 6px 7px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 32px;
+    height: 32px;
     background: transparent;
-    border: none;
+    border: 1px solid transparent;
     border-radius: 8px;
     cursor: pointer;
-    font-size: 13px;
-    color: #e0e0e0;
-    transition: background 0.15s;
+    color: rgba(255, 255, 255, 0.75);
+    transition: all 0.15s;
   }
 
   .icon-btn:hover:not(:disabled) {
-    background: rgba(255, 255, 255, 0.08);
+    background: rgba(255, 255, 255, 0.09);
+    color: #ffffff;
   }
 
   .icon-btn.active {
     background: rgba(0, 199, 190, 0.25);
-    border: 1px solid rgba(0, 199, 190, 0.4);
+    border-color: rgba(0, 199, 190, 0.4);
+    color: #00c7be;
   }
 
   .icon-btn:disabled {
@@ -1302,10 +1613,11 @@
   }
 
   .icon-btn.danger:hover {
-    background: rgba(255, 59, 48, 0.25);
+    background: rgba(255, 59, 48, 0.22);
+    color: #ff3b30;
   }
 
-  /* Multi-Monitor Buttons */
+  /* Multi-Monitor Switcher */
   .monitor-group {
     display: flex;
     align-items: center;
@@ -1313,7 +1625,10 @@
   }
 
   .mon-btn {
-    padding: 3px 6px;
+    display: flex;
+    align-items: center;
+    gap: 3px;
+    padding: 4px 7px;
     font-size: 11px;
     background: rgba(255, 255, 255, 0.08);
     border: 1px solid rgba(255, 255, 255, 0.14);
@@ -1328,9 +1643,12 @@
     color: white;
   }
 
-  /* Ghost Mode Toggle */
+  /* Ghost Mode Button */
   .ghost-btn {
-    padding: 5px 9px;
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    padding: 5px 10px;
     background: rgba(255, 255, 255, 0.07);
     border: 1px solid rgba(255, 255, 255, 0.15);
     border-radius: 9px;
@@ -1343,24 +1661,28 @@
 
   .ghost-btn:hover {
     background: rgba(255, 255, 255, 0.14);
+    color: #ffffff;
   }
 
   .ghost-btn.active {
     background: #af52de;
     border-color: #af52de;
     color: #ffffff;
-    box-shadow: 0 0 12px rgba(175, 82, 222, 0.6);
+    box-shadow: 0 0 14px rgba(175, 82, 222, 0.6);
   }
 
   .collapse-btn {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 28px;
+    height: 28px;
     background: transparent;
     border: none;
     color: rgba(255, 255, 255, 0.5);
     cursor: pointer;
-    padding: 4px 6px;
-    font-size: 11px;
     border-radius: 6px;
-    transition: color 0.15s;
+    transition: all 0.15s;
   }
 
   .collapse-btn:hover {
@@ -1375,21 +1697,21 @@
     left: 0;
     width: 100vw;
     height: 100vh;
-    background: rgba(0, 0, 0, 0.5);
-    backdrop-filter: blur(8px);
-    z-index: 1000000;
+    background: rgba(0, 0, 0, 0.55);
+    backdrop-filter: blur(10px);
+    z-index: 10000000;
     display: flex;
     align-items: center;
     justify-content: center;
   }
 
   .modal-card {
-    background: rgba(24, 24, 28, 0.95);
-    border: 1px solid rgba(255, 255, 255, 0.18);
+    background: rgba(24, 24, 30, 0.96);
+    border: 1px solid rgba(255, 255, 255, 0.16);
     border-radius: 16px;
-    width: 360px;
-    padding: 16px 20px;
-    box-shadow: 0 20px 48px rgba(0, 0, 0, 0.6);
+    width: 390px;
+    padding: 18px 22px;
+    box-shadow: 0 20px 50px rgba(0, 0, 0, 0.65);
     color: #ffffff;
   }
 
@@ -1397,12 +1719,19 @@
     display: flex;
     align-items: center;
     justify-content: space-between;
-    margin-bottom: 14px;
+    margin-bottom: 16px;
   }
 
-  .modal-header h3 {
+  .modal-title {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .modal-title h3 {
     margin: 0;
     font-size: 16px;
+    font-weight: 700;
   }
 
   .modal-close {
@@ -1410,13 +1739,23 @@
     border: none;
     color: rgba(255, 255, 255, 0.6);
     cursor: pointer;
-    font-size: 14px;
+    padding: 4px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 6px;
+    transition: color 0.15s;
+  }
+
+  .modal-close:hover {
+    color: #ffffff;
+    background: rgba(255, 255, 255, 0.08);
   }
 
   .modal-body {
     display: flex;
     flex-direction: column;
-    gap: 9px;
+    gap: 10px;
   }
 
   .shortcut-row {
@@ -1431,9 +1770,9 @@
     background: rgba(255, 255, 255, 0.12);
     border: 1px solid rgba(255, 255, 255, 0.2);
     border-radius: 5px;
-    padding: 2px 7px;
+    padding: 3px 8px;
     font-size: 11px;
-    font-family: monospace;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
     color: #ffffff;
   }
 </style>
