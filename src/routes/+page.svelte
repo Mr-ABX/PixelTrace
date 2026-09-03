@@ -1,9 +1,9 @@
 <script lang="ts">
-  import { onMount } from "svelte";
+  import { onMount, tick } from "svelte";
   import { invoke } from "@tauri-apps/api/core";
 
   // Tool types
-  type Tool = "laser" | "pen" | "highlighter" | "arrow" | "rect" | "circle" | "line" | "stamp";
+  type Tool = "laser" | "pen" | "highlighter" | "arrow" | "rect" | "circle" | "line" | "stamp" | "text";
 
   interface Point {
     x: number;
@@ -12,6 +12,7 @@
   }
 
   interface DrawItem {
+    id: string;
     tool: Tool;
     color: string;
     size: number;
@@ -19,18 +20,47 @@
     start?: Point;
     end?: Point;
     stampNumber?: number;
+    text?: string;
+    textPoint?: Point;
+    createdAt?: number;
+  }
+
+  interface MonitorInfo {
+    name: string | null;
+    width: number;
+    height: number;
+    x: number;
+    y: number;
+    scale_factor: number;
   }
 
   // Reactive application state
   let currentTool = $state<Tool>("laser");
   let currentColor = $state("#FF3B30"); // Default neon red
-  let currentSize = $state(4); // Stroke size
+  let currentSize = $state(4); // Default stroke size
   let isGhostMode = $state(false); // Click-through
   let stampCounter = $state(1);
+
+  // Auto-Fade Mode
+  let autoFadeEnabled = $state(false);
+  const AUTO_FADE_MS = 3500;
+
+  // Multi-Monitor state
+  let monitors = $state<MonitorInfo[]>([]);
+  let activeMonitorIndex = $state(0);
 
   // History for Undo/Redo
   let history = $state<DrawItem[]>([]);
   let redoStack = $state<DrawItem[]>([]);
+
+  // Text Tool State
+  let isTextActive = $state(false);
+  let textPos = $state({ x: 0, y: 0 });
+  let textInput = $state("");
+  let textInputRef = $state<HTMLInputElement | null>(null);
+
+  // Settings / Help modal
+  let showHelpModal = $state(false);
 
   // Canvas references
   let staticCanvas: HTMLCanvasElement;
@@ -57,6 +87,14 @@
   let dockEdge = $state<"left" | "right" | "top" | "bottom">("left");
   let isCollapsed = $state(false);
 
+  // Stroke Size Presets
+  const sizePresets = [
+    { label: "Fine", val: 2 },
+    { label: "Med", val: 4 },
+    { label: "Thick", val: 8 },
+    { label: "Heavy", val: 14 }
+  ];
+
   // Color Palette
   const colors = [
     { name: "Neon Red", hex: "#FF3B30" },
@@ -67,10 +105,20 @@
     { name: "Pure White", hex: "#FFFFFF" }
   ];
 
-  onMount(() => {
+  onMount(async () => {
     initCanvases();
     window.addEventListener("resize", handleResize);
     window.addEventListener("keydown", handleKeyDown);
+
+    // Fetch system monitors
+    try {
+      const res = await invoke<MonitorInfo[]>("get_monitors");
+      if (Array.isArray(res)) {
+        monitors = res;
+      }
+    } catch (e) {
+      console.warn("Could not fetch monitors:", e);
+    }
 
     return () => {
       window.removeEventListener("resize", handleResize);
@@ -116,32 +164,31 @@
     if (!dynamicCtx) return;
     dynamicCtx.clearRect(0, 0, window.innerWidth, window.innerHeight);
 
-    // Remove expired points
+    // Filter points older than decay limit
     laserTrail = laserTrail.filter((p) => now - (p.time || 0) < LASER_DECAY_MS);
 
     if (laserTrail.length > 0) {
       for (let i = 0; i < laserTrail.length; i++) {
         const p = laserTrail[i];
         const age = now - (p.time || 0);
-        const progress = 1 - age / LASER_DECAY_MS; // 1.0 (head) -> 0.0 (tail)
+        const progress = 1 - age / LASER_DECAY_MS;
 
-        // Draw glowing laser trail segment
         const radius = Math.max(2, (currentSize + 2) * progress);
         dynamicCtx.beginPath();
         dynamicCtx.arc(p.x, p.y, radius, 0, Math.PI * 2);
         dynamicCtx.fillStyle = `rgba(${hexToRgb(currentColor)}, ${progress * 0.85})`;
         dynamicCtx.shadowColor = currentColor;
-        dynamicCtx.shadowBlur = 12 * progress;
+        dynamicCtx.shadowBlur = 14 * progress;
         dynamicCtx.fill();
       }
 
-      // Draw high-intensity glowing head
+      // Draw high-intensity glowing cursor head
       const head = laserTrail[laserTrail.length - 1];
       dynamicCtx.beginPath();
       dynamicCtx.arc(head.x, head.y, currentSize + 4, 0, Math.PI * 2);
       dynamicCtx.fillStyle = "#FFFFFF";
       dynamicCtx.shadowColor = currentColor;
-      dynamicCtx.shadowBlur = 20;
+      dynamicCtx.shadowBlur = 22;
       dynamicCtx.fill();
 
       dynamicCtx.beginPath();
@@ -174,9 +221,24 @@
   // --- MOUSE & DRAWING HANDLERS ---
   function onPointerDown(e: PointerEvent) {
     if (isGhostMode) return;
-    // Don't draw if interacting with widget
     const target = e.target as HTMLElement;
-    if (target && target.closest(".widget-container")) return;
+    if (target && (target.closest(".widget-container") || target.closest(".inline-text-box"))) return;
+
+    if (currentTool === "text") {
+      commitText();
+      textPos = { x: e.clientX, y: e.clientY };
+      textInput = "";
+      isTextActive = true;
+      tick().then(() => {
+        textInputRef?.focus();
+      });
+      return;
+    }
+
+    // Commit any open text if user clicked away
+    if (isTextActive) {
+      commitText();
+    }
 
     isDrawing = true;
     startPoint = { x: e.clientX, y: e.clientY };
@@ -186,18 +248,17 @@
     } else if (currentTool === "pen" || currentTool === "highlighter") {
       currentStrokePoints = [{ x: e.clientX, y: e.clientY }];
     } else if (currentTool === "stamp") {
-      // Place stamp immediately
       const stampItem: DrawItem = {
+        id: crypto.randomUUID(),
         tool: "stamp",
         color: currentColor,
         size: currentSize,
         start: { x: e.clientX, y: e.clientY },
-        stampNumber: stampCounter
+        stampNumber: stampCounter,
+        createdAt: Date.now()
       };
-      history.push(stampItem);
+      addItemToHistory(stampItem);
       stampCounter += 1;
-      redoStack = [];
-      redrawStaticCanvas();
       isDrawing = false;
     }
   }
@@ -224,34 +285,71 @@
 
     if (currentTool === "pen" || currentTool === "highlighter") {
       if (currentStrokePoints.length > 0) {
-        history.push({
+        const item: DrawItem = {
+          id: crypto.randomUUID(),
           tool: currentTool,
           color: currentColor,
           size: currentTool === "highlighter" ? currentSize * 3.5 : currentSize,
-          points: [...currentStrokePoints]
-        });
-        redoStack = [];
+          points: [...currentStrokePoints],
+          createdAt: Date.now()
+        };
+        addItemToHistory(item);
         currentStrokePoints = [];
         dynamicCtx.clearRect(0, 0, window.innerWidth, window.innerHeight);
-        redrawStaticCanvas();
       }
     } else if (["arrow", "rect", "circle", "line"].includes(currentTool)) {
       const endPoint = { x: e.clientX, y: e.clientY };
-      // Ignore tiny jitter clicks
       const dist = Math.hypot(endPoint.x - startPoint.x, endPoint.y - startPoint.y);
       if (dist > 5) {
-        history.push({
+        const item: DrawItem = {
+          id: crypto.randomUUID(),
           tool: currentTool,
           color: currentColor,
           size: currentSize,
           start: { ...startPoint },
-          end: endPoint
-        });
-        redoStack = [];
+          end: endPoint,
+          createdAt: Date.now()
+        };
+        addItemToHistory(item);
         dynamicCtx.clearRect(0, 0, window.innerWidth, window.innerHeight);
-        redrawStaticCanvas();
       }
     }
+  }
+
+  function addItemToHistory(item: DrawItem) {
+    history.push(item);
+    redoStack = [];
+    redrawStaticCanvas();
+
+    // Auto-fade timer if active
+    if (autoFadeEnabled) {
+      setTimeout(() => {
+        history = history.filter((h) => h.id !== item.id);
+        redrawStaticCanvas();
+      }, AUTO_FADE_MS);
+    }
+  }
+
+  function commitText() {
+    if (isTextActive && textInput.trim().length > 0) {
+      const item: DrawItem = {
+        id: crypto.randomUUID(),
+        tool: "text",
+        color: currentColor,
+        size: Math.max(16, currentSize * 4),
+        text: textInput.trim(),
+        textPoint: { ...textPos },
+        createdAt: Date.now()
+      };
+      addItemToHistory(item);
+    }
+    isTextActive = false;
+    textInput = "";
+  }
+
+  function cancelText() {
+    isTextActive = false;
+    textInput = "";
   }
 
   // --- VECTOR RENDERING ---
@@ -263,8 +361,11 @@
     ctx.beginPath();
     ctx.moveTo(currentStrokePoints[0].x, currentStrokePoints[0].y);
 
-    for (let i = 1; i < currentStrokePoints.length; i++) {
-      ctx.lineTo(currentStrokePoints[i].x, currentStrokePoints[i].y);
+    // Bézier curve smoothing for natural fluid strokes
+    for (let i = 1; i < currentStrokePoints.length - 1; i++) {
+      const xc = (currentStrokePoints[i].x + currentStrokePoints[i + 1].x) / 2;
+      const yc = (currentStrokePoints[i].y + currentStrokePoints[i + 1].y) / 2;
+      ctx.quadraticCurveTo(currentStrokePoints[i].x, currentStrokePoints[i].y, xc, yc);
     }
 
     ctx.strokeStyle = currentColor;
@@ -289,11 +390,6 @@
   ) {
     ctx.clearRect(0, 0, window.innerWidth, window.innerHeight);
     ctx.save();
-    ctx.strokeStyle = currentColor;
-    ctx.lineWidth = currentSize;
-    ctx.lineCap = "round";
-    ctx.lineJoin = "round";
-
     drawSingleShape(ctx, tool, start, end, currentColor, currentSize);
     ctx.restore();
   }
@@ -328,13 +424,11 @@
       ctx.ellipse(centerX, centerY, radiusX, radiusY, 0, 0, Math.PI * 2);
       ctx.stroke();
     } else if (tool === "arrow") {
-      // Draw main line
       ctx.beginPath();
       ctx.moveTo(start.x, start.y);
       ctx.lineTo(end.x, end.y);
       ctx.stroke();
 
-      // Calculate arrowhead angle
       const angle = Math.atan2(end.y - start.y, end.x - start.x);
       const headLength = Math.max(16, size * 3.5);
 
@@ -359,39 +453,31 @@
 
     for (const item of history) {
       staticCtx.save();
-      if (item.tool === "pen" && item.points && item.points.length > 1) {
+      if ((item.tool === "pen" || item.tool === "highlighter") && item.points && item.points.length > 1) {
         staticCtx.beginPath();
         staticCtx.moveTo(item.points[0].x, item.points[0].y);
-        for (let i = 1; i < item.points.length; i++) {
-          staticCtx.lineTo(item.points[i].x, item.points[i].y);
+        for (let i = 1; i < item.points.length - 1; i++) {
+          const xc = (item.points[i].x + item.points[i + 1].x) / 2;
+          const yc = (item.points[i].y + item.points[i + 1].y) / 2;
+          staticCtx.quadraticCurveTo(item.points[i].x, item.points[i].y, xc, yc);
         }
         staticCtx.strokeStyle = item.color;
         staticCtx.lineWidth = item.size;
         staticCtx.lineCap = "round";
         staticCtx.lineJoin = "round";
-        staticCtx.stroke();
-      } else if (item.tool === "highlighter" && item.points && item.points.length > 1) {
-        staticCtx.beginPath();
-        staticCtx.moveTo(item.points[0].x, item.points[0].y);
-        for (let i = 1; i < item.points.length; i++) {
-          staticCtx.lineTo(item.points[i].x, item.points[i].y);
+        if (item.tool === "highlighter") {
+          staticCtx.globalAlpha = 0.38;
         }
-        staticCtx.strokeStyle = item.color;
-        staticCtx.lineWidth = item.size;
-        staticCtx.lineCap = "round";
-        staticCtx.lineJoin = "round";
-        staticCtx.globalAlpha = 0.38;
         staticCtx.stroke();
       } else if (item.start && item.end) {
         drawSingleShape(staticCtx, item.tool, item.start, item.end, item.color, item.size);
       } else if (item.tool === "stamp" && item.start && item.stampNumber) {
-        // Draw circular numbered badge
         const r = 16;
         staticCtx.beginPath();
         staticCtx.arc(item.start.x, item.start.y, r, 0, Math.PI * 2);
         staticCtx.fillStyle = item.color;
-        staticCtx.shadowColor = "rgba(0,0,0,0.4)";
-        staticCtx.shadowBlur = 6;
+        staticCtx.shadowColor = "rgba(0,0,0,0.45)";
+        staticCtx.shadowBlur = 8;
         staticCtx.fill();
 
         staticCtx.shadowBlur = 0;
@@ -400,6 +486,14 @@
         staticCtx.textAlign = "center";
         staticCtx.textBaseline = "middle";
         staticCtx.fillText(String(item.stampNumber), item.start.x, item.start.y + 1);
+      } else if (item.tool === "text" && item.text && item.textPoint) {
+        staticCtx.font = `bold ${item.size}px -apple-system, BlinkMacSystemFont, sans-serif`;
+        // Dark outline for legibility
+        staticCtx.strokeStyle = "rgba(0, 0, 0, 0.85)";
+        staticCtx.lineWidth = 4;
+        staticCtx.strokeText(item.text, item.textPoint.x, item.textPoint.y);
+        staticCtx.fillStyle = item.color;
+        staticCtx.fillText(item.text, item.textPoint.x, item.textPoint.y);
       }
       staticCtx.restore();
     }
@@ -424,6 +518,7 @@
     history = [];
     redoStack = [];
     stampCounter = 1;
+    isTextActive = false;
     if (staticCtx) staticCtx.clearRect(0, 0, window.innerWidth, window.innerHeight);
     if (dynamicCtx) dynamicCtx.clearRect(0, 0, window.innerWidth, window.innerHeight);
   }
@@ -453,19 +548,63 @@
     }
   }
 
+  // --- CAPTURE SCREENSHOT ---
+  function captureSnapshot() {
+    if (!staticCanvas) return;
+    try {
+      staticCanvas.toBlob((blob) => {
+        if (blob) {
+          navigator.clipboard.write([new ClipboardItem({ "image/png": blob })])
+            .then(() => alert("✅ Annotated screenshot copied to clipboard!"))
+            .catch(() => {
+              const a = document.createElement("a");
+              a.href = staticCanvas.toDataURL("image/png");
+              a.download = `pixeltrace-${Date.now()}.png`;
+              a.click();
+            });
+        }
+      });
+    } catch (e) {
+      console.error("Snapshot error:", e);
+    }
+  }
+
+  // --- MULTI-MONITOR SWITCHING ---
+  async function switchToMonitor(index: number) {
+    if (!monitors[index]) return;
+    const m = monitors[index];
+    try {
+      await invoke("focus_monitor", {
+        x: m.x,
+        y: m.y,
+        width: m.width,
+        height: m.height
+      });
+      activeMonitorIndex = index;
+    } catch (e) {
+      console.error("Failed to switch monitor:", e);
+    }
+  }
+
   // --- SHORTCUTS ---
   function handleKeyDown(e: KeyboardEvent) {
-    if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
+    if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) {
+      if (e.key === "Enter") {
+        e.preventDefault();
+        commitText();
+      } else if (e.key === "Escape") {
+        e.preventDefault();
+        cancelText();
+      }
+      return;
+    }
 
     const key = e.key.toLowerCase();
 
     if ((e.metaKey || e.ctrlKey) && key === "z") {
       e.preventDefault();
-      if (e.shiftKey) {
-        redo();
-      } else {
-        undo();
-      }
+      if (e.shiftKey) redo();
+      else undo();
       return;
     }
 
@@ -492,6 +631,7 @@
     if (key === "r" || key === "5") currentTool = "rect";
     if (key === "c" || key === "6") currentTool = "circle";
     if (key === "s" || key === "7") currentTool = "stamp";
+    if (key === "t" || key === "8") currentTool = "text";
 
     if (e.key === " ") {
       e.preventDefault();
@@ -521,7 +661,6 @@
     window.removeEventListener("mousemove", onDragMove);
     window.removeEventListener("mouseup", onDragEnd);
 
-    // Magnetic edge snapping (< 50px threshold)
     const threshold = 50;
     const w = window.innerWidth;
     const h = window.innerHeight;
@@ -530,8 +669,8 @@
       widgetX = 12;
       isDocked = true;
       dockEdge = "left";
-    } else if (widgetX > w - 460 - threshold) {
-      widgetX = w - 470;
+    } else if (widgetX > w - 620 - threshold) {
+      widgetX = w - 630;
       isDocked = true;
       dockEdge = "right";
     } else if (widgetY < threshold) {
@@ -561,6 +700,22 @@
   onpointermove={onPointerMove}
   onpointerup={onPointerUp}
 ></canvas>
+
+<!-- Inline Editable Text Box -->
+{#if isTextActive}
+  <div
+    class="inline-text-box"
+    style="left: {textPos.x}px; top: {textPos.y - 20}px;"
+  >
+    <input
+      bind:this={textInputRef}
+      bind:value={textInput}
+      style="color: {currentColor}; font-size: {Math.max(16, currentSize * 4)}px;"
+      placeholder="Type note and press Enter..."
+    />
+    <div class="text-hint">Press Enter to place, Esc to cancel</div>
+  </div>
+{/if}
 
 <!-- Floating Edge-Docking Widget Container -->
 <div
@@ -604,7 +759,6 @@
         </svg>
       </div>
 
-      <!-- Divider -->
       <div class="divider"></div>
 
       <!-- Tools Group -->
@@ -614,7 +768,7 @@
           class="tool-btn"
           class:active={currentTool === "laser"}
           onclick={() => (currentTool = "laser")}
-          title="Laser Pointer (L or 1)"
+          title="Laser Pointer (L or 1) — Decaying trail"
         >
           <span class="laser-dot" style="background-color: {currentColor}"></span>
           <span class="label">Laser</span>
@@ -625,7 +779,7 @@
           class="tool-btn"
           class:active={currentTool === "pen"}
           onclick={() => (currentTool = "pen")}
-          title="Pen (P or 2)"
+          title="Smooth Pen (P or 2)"
         >
           ✏️
         </button>
@@ -670,6 +824,16 @@
           ⭕
         </button>
 
+        <!-- Text Tool -->
+        <button
+          class="tool-btn"
+          class:active={currentTool === "text"}
+          onclick={() => (currentTool = "text")}
+          title="Text Note (T or 8) — Click anywhere to type"
+        >
+          🔤
+        </button>
+
         <!-- Numbered Stamp -->
         <button
           class="tool-btn stamp-btn"
@@ -683,6 +847,22 @@
         >
           <span class="stamp-badge">{stampCounter}</span>
         </button>
+      </div>
+
+      <div class="divider"></div>
+
+      <!-- Stroke Size Presets -->
+      <div class="size-group">
+        {#each sizePresets as s}
+          <button
+            class="size-chip"
+            class:active={currentSize === s.val}
+            onclick={() => (currentSize = s.val)}
+            title="{s.label} stroke ({s.val}px)"
+          >
+            <span class="size-dot" style="width: {s.val + 2}px; height: {s.val + 2}px;"></span>
+          </button>
+        {/each}
       </div>
 
       <div class="divider"></div>
@@ -702,7 +882,7 @@
 
       <div class="divider"></div>
 
-      <!-- History & Clear -->
+      <!-- Undo, Redo, Snapshot, Clear -->
       <div class="btn-group">
         <button
           class="icon-btn"
@@ -722,6 +902,25 @@
           ↪️
         </button>
 
+        <!-- Capture Snapshot -->
+        <button
+          class="icon-btn"
+          onclick={captureSnapshot}
+          title="Copy Screenshot to Clipboard"
+        >
+          📸
+        </button>
+
+        <!-- Auto Fade Toggle -->
+        <button
+          class="icon-btn"
+          class:active={autoFadeEnabled}
+          onclick={() => (autoFadeEnabled = !autoFadeEnabled)}
+          title="Auto-Fade Strokes (3.5s): {autoFadeEnabled ? 'ON' : 'OFF'}"
+        >
+          ⏳
+        </button>
+
         <button
           class="icon-btn danger"
           onclick={clearCanvas}
@@ -733,6 +932,23 @@
 
       <div class="divider"></div>
 
+      <!-- Multi-Monitor Switcher (if > 1 monitor detected) -->
+      {#if monitors.length > 1}
+        <div class="monitor-group">
+          {#each monitors as m, idx}
+            <button
+              class="mon-btn"
+              class:active={activeMonitorIndex === idx}
+              onclick={() => switchToMonitor(idx)}
+              title="Switch overlay to Monitor {idx + 1}"
+            >
+              🖥️ {idx + 1}
+            </button>
+          {/each}
+        </div>
+        <div class="divider"></div>
+      {/if}
+
       <!-- Ghost Mode (Click-Through) -->
       <button
         class="ghost-btn"
@@ -741,6 +957,15 @@
         title="Ghost Mode (X) — Pass clicks through to apps below"
       >
         {isGhostMode ? "👻 Ghost" : "👁️ Draw"}
+      </button>
+
+      <!-- Settings / Info Button -->
+      <button
+        class="icon-btn"
+        onclick={() => (showHelpModal = !showHelpModal)}
+        title="Keyboard Shortcuts & About"
+      >
+        ⚙️
       </button>
 
       <!-- Collapse / Dock Button -->
@@ -754,6 +979,52 @@
     </div>
   {/if}
 </div>
+
+<!-- Shortcuts & Info Modal -->
+{#if showHelpModal}
+  <div class="modal-backdrop" onclick={() => (showHelpModal = false)}>
+    <div class="modal-card" onclick={(e) => e.stopPropagation()}>
+      <div class="modal-header">
+        <h3>⚡ PixelTrace Quick Shortcuts</h3>
+        <button class="modal-close" onclick={() => (showHelpModal = false)}>✕</button>
+      </div>
+      <div class="modal-body">
+        <div class="shortcut-row">
+          <span>Toggle Overlay (Global)</span>
+          <kbd>⌘ + Shift + D</kbd>
+        </div>
+        <div class="shortcut-row">
+          <span>Ghost / Click-Through Mode</span>
+          <kbd>X</kbd>
+        </div>
+        <div class="shortcut-row">
+          <span>Laser / Pen / Highlighter</span>
+          <kbd>L / P / H</kbd>
+        </div>
+        <div class="shortcut-row">
+          <span>Arrow / Rect / Circle / Line</span>
+          <kbd>A / R / C</kbd>
+        </div>
+        <div class="shortcut-row">
+          <span>Numbered Stamp / Text</span>
+          <kbd>S / T</kbd>
+        </div>
+        <div class="shortcut-row">
+          <span>Collapse / Expand Toolbar</span>
+          <kbd>Space</kbd>
+        </div>
+        <div class="shortcut-row">
+          <span>Undo / Redo</span>
+          <kbd>⌘Z / ⌘⇧Z</kbd>
+        </div>
+        <div class="shortcut-row">
+          <span>Clear All Markups</span>
+          <kbd>Esc</kbd>
+        </div>
+      </div>
+    </div>
+  </div>
+{/if}
 
 <style>
   :global(body) {
@@ -777,6 +1048,34 @@
     z-index: 10;
   }
 
+  /* Inline Text Box */
+  .inline-text-box {
+    position: fixed;
+    z-index: 100000;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    background: rgba(15, 15, 18, 0.85);
+    backdrop-filter: blur(16px);
+    border: 1px solid rgba(255, 255, 255, 0.2);
+    border-radius: 8px;
+    padding: 6px 10px;
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
+  }
+
+  .inline-text-box input {
+    background: transparent;
+    border: none;
+    outline: none;
+    font-weight: bold;
+    min-width: 220px;
+  }
+
+  .text-hint {
+    font-size: 10px;
+    color: rgba(255, 255, 255, 0.5);
+  }
+
   /* Floating Glassmorphic Container */
   .widget-container {
     position: fixed;
@@ -785,7 +1084,7 @@
     z-index: 999999;
     pointer-events: auto;
     transition: transform 0.08s ease-out;
-    filter: drop-shadow(0 12px 28px rgba(0, 0, 0, 0.45));
+    filter: drop-shadow(0 14px 32px rgba(0, 0, 0, 0.5));
   }
 
   .widget-container.collapsed {
@@ -831,12 +1130,12 @@
   .glass-bar {
     display: flex;
     align-items: center;
-    gap: 7px;
+    gap: 6px;
     padding: 6px 10px;
-    background: rgba(22, 22, 26, 0.82);
-    backdrop-filter: blur(24px) saturate(180%);
-    -webkit-backdrop-filter: blur(24px) saturate(180%);
-    border: 1px solid rgba(255, 255, 255, 0.14);
+    background: rgba(20, 20, 24, 0.84);
+    backdrop-filter: blur(26px) saturate(190%);
+    -webkit-backdrop-filter: blur(26px) saturate(190%);
+    border: 1px solid rgba(255, 255, 255, 0.15);
     border-radius: 16px;
     color: #ececed;
   }
@@ -864,17 +1163,17 @@
   .btn-group {
     display: flex;
     align-items: center;
-    gap: 4px;
+    gap: 3px;
   }
 
   .tool-btn {
     display: flex;
     align-items: center;
     gap: 5px;
-    padding: 6px 9px;
+    padding: 6px 8px;
     background: transparent;
     border: 1px solid transparent;
-    border-radius: 10px;
+    border-radius: 9px;
     color: #e0e0e0;
     font-size: 14px;
     cursor: pointer;
@@ -900,7 +1199,7 @@
   }
 
   .stamp-btn {
-    padding: 4px 8px;
+    padding: 4px 6px;
   }
 
   .stamp-badge {
@@ -916,11 +1215,45 @@
     border-radius: 50%;
   }
 
+  /* Stroke Size Presets */
+  .size-group {
+    display: flex;
+    align-items: center;
+    gap: 3px;
+  }
+
+  .size-chip {
+    width: 20px;
+    height: 20px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: 4px;
+    cursor: pointer;
+    padding: 0;
+  }
+
+  .size-chip:hover {
+    background: rgba(255, 255, 255, 0.08);
+  }
+
+  .size-chip.active {
+    border-color: rgba(255, 255, 255, 0.4);
+    background: rgba(255, 255, 255, 0.14);
+  }
+
+  .size-dot {
+    background: #ffffff;
+    border-radius: 50%;
+  }
+
   /* Color Palette Chips */
   .color-palette {
     display: flex;
     align-items: center;
-    gap: 5px;
+    gap: 4px;
   }
 
   .color-chip {
@@ -944,7 +1277,7 @@
   }
 
   .icon-btn {
-    padding: 6px 8px;
+    padding: 6px 7px;
     background: transparent;
     border: none;
     border-radius: 8px;
@@ -958,6 +1291,11 @@
     background: rgba(255, 255, 255, 0.08);
   }
 
+  .icon-btn.active {
+    background: rgba(0, 199, 190, 0.25);
+    border: 1px solid rgba(0, 199, 190, 0.4);
+  }
+
   .icon-btn:disabled {
     opacity: 0.3;
     cursor: not-allowed;
@@ -967,12 +1305,35 @@
     background: rgba(255, 59, 48, 0.25);
   }
 
+  /* Multi-Monitor Buttons */
+  .monitor-group {
+    display: flex;
+    align-items: center;
+    gap: 3px;
+  }
+
+  .mon-btn {
+    padding: 3px 6px;
+    font-size: 11px;
+    background: rgba(255, 255, 255, 0.08);
+    border: 1px solid rgba(255, 255, 255, 0.14);
+    border-radius: 6px;
+    color: #e0e0e0;
+    cursor: pointer;
+  }
+
+  .mon-btn.active {
+    background: #007aff;
+    border-color: #007aff;
+    color: white;
+  }
+
   /* Ghost Mode Toggle */
   .ghost-btn {
-    padding: 5px 10px;
+    padding: 5px 9px;
     background: rgba(255, 255, 255, 0.07);
     border: 1px solid rgba(255, 255, 255, 0.15);
-    border-radius: 10px;
+    border-radius: 9px;
     color: #e0e0e0;
     font-size: 12px;
     font-weight: 600;
@@ -1005,5 +1366,74 @@
   .collapse-btn:hover {
     color: #ffffff;
     background: rgba(255, 255, 255, 0.08);
+  }
+
+  /* Modal Dialog */
+  .modal-backdrop {
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 100vw;
+    height: 100vh;
+    background: rgba(0, 0, 0, 0.5);
+    backdrop-filter: blur(8px);
+    z-index: 1000000;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .modal-card {
+    background: rgba(24, 24, 28, 0.95);
+    border: 1px solid rgba(255, 255, 255, 0.18);
+    border-radius: 16px;
+    width: 360px;
+    padding: 16px 20px;
+    box-shadow: 0 20px 48px rgba(0, 0, 0, 0.6);
+    color: #ffffff;
+  }
+
+  .modal-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 14px;
+  }
+
+  .modal-header h3 {
+    margin: 0;
+    font-size: 16px;
+  }
+
+  .modal-close {
+    background: transparent;
+    border: none;
+    color: rgba(255, 255, 255, 0.6);
+    cursor: pointer;
+    font-size: 14px;
+  }
+
+  .modal-body {
+    display: flex;
+    flex-direction: column;
+    gap: 9px;
+  }
+
+  .shortcut-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    font-size: 13px;
+    color: #d1d1d6;
+  }
+
+  kbd {
+    background: rgba(255, 255, 255, 0.12);
+    border: 1px solid rgba(255, 255, 255, 0.2);
+    border-radius: 5px;
+    padding: 2px 7px;
+    font-size: 11px;
+    font-family: monospace;
+    color: #ffffff;
   }
 </style>
