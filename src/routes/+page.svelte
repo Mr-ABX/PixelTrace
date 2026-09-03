@@ -1,156 +1,1009 @@
 <script lang="ts">
+  import { onMount } from "svelte";
   import { invoke } from "@tauri-apps/api/core";
 
-  let name = $state("");
-  let greetMsg = $state("");
+  // Tool types
+  type Tool = "laser" | "pen" | "highlighter" | "arrow" | "rect" | "circle" | "line" | "stamp";
 
-  async function greet(event: Event) {
-    event.preventDefault();
-    // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
-    greetMsg = await invoke("greet", { name });
+  interface Point {
+    x: number;
+    y: number;
+    time?: number;
+  }
+
+  interface DrawItem {
+    tool: Tool;
+    color: string;
+    size: number;
+    points?: Point[];
+    start?: Point;
+    end?: Point;
+    stampNumber?: number;
+  }
+
+  // Reactive application state
+  let currentTool = $state<Tool>("laser");
+  let currentColor = $state("#FF3B30"); // Default neon red
+  let currentSize = $state(4); // Stroke size
+  let isGhostMode = $state(false); // Click-through
+  let stampCounter = $state(1);
+
+  // History for Undo/Redo
+  let history = $state<DrawItem[]>([]);
+  let redoStack = $state<DrawItem[]>([]);
+
+  // Canvas references
+  let staticCanvas: HTMLCanvasElement;
+  let dynamicCanvas: HTMLCanvasElement;
+  let staticCtx: CanvasRenderingContext2D;
+  let dynamicCtx: CanvasRenderingContext2D;
+
+  // Drawing state
+  let isDrawing = false;
+  let startPoint = { x: 0, y: 0 };
+  let currentStrokePoints: Point[] = [];
+
+  // Laser trail queue
+  let laserTrail: Point[] = [];
+  let laserRafId: number | null = null;
+  const LASER_DECAY_MS = 650;
+
+  // Floating Widget state
+  let widgetX = $state(80);
+  let widgetY = $state(60);
+  let isDragging = false;
+  let dragOffset = { x: 0, y: 0 };
+  let isDocked = $state(false);
+  let dockEdge = $state<"left" | "right" | "top" | "bottom">("left");
+  let isCollapsed = $state(false);
+
+  // Color Palette
+  const colors = [
+    { name: "Neon Red", hex: "#FF3B30" },
+    { name: "Electric Yellow", hex: "#FFCC00" },
+    { name: "Neon Green", hex: "#34C759" },
+    { name: "Cyan Blue", hex: "#00C7BE" },
+    { name: "Electric Purple", hex: "#AF52DE" },
+    { name: "Pure White", hex: "#FFFFFF" }
+  ];
+
+  onMount(() => {
+    initCanvases();
+    window.addEventListener("resize", handleResize);
+    window.addEventListener("keydown", handleKeyDown);
+
+    return () => {
+      window.removeEventListener("resize", handleResize);
+      window.removeEventListener("keydown", handleKeyDown);
+      if (laserRafId) cancelAnimationFrame(laserRafId);
+    };
+  });
+
+  function initCanvases() {
+    if (!staticCanvas || !dynamicCanvas) return;
+    const dpr = window.devicePixelRatio || 1;
+    const w = window.innerWidth;
+    const h = window.innerHeight;
+
+    staticCanvas.width = w * dpr;
+    staticCanvas.height = h * dpr;
+    dynamicCanvas.width = w * dpr;
+    dynamicCanvas.height = h * dpr;
+
+    staticCtx = staticCanvas.getContext("2d")!;
+    dynamicCtx = dynamicCanvas.getContext("2d")!;
+
+    staticCtx.scale(dpr, dpr);
+    dynamicCtx.scale(dpr, dpr);
+
+    redrawStaticCanvas();
+  }
+
+  function handleResize() {
+    initCanvases();
+  }
+
+  // --- LASER POINTER ENGINE ---
+  function updateLaserTrail(x: number, y: number) {
+    const now = performance.now();
+    laserTrail.push({ x, y, time: now });
+    if (!laserRafId) {
+      laserRafId = requestAnimationFrame(renderLaserLoop);
+    }
+  }
+
+  function renderLaserLoop(now: number) {
+    if (!dynamicCtx) return;
+    dynamicCtx.clearRect(0, 0, window.innerWidth, window.innerHeight);
+
+    // Remove expired points
+    laserTrail = laserTrail.filter((p) => now - (p.time || 0) < LASER_DECAY_MS);
+
+    if (laserTrail.length > 0) {
+      for (let i = 0; i < laserTrail.length; i++) {
+        const p = laserTrail[i];
+        const age = now - (p.time || 0);
+        const progress = 1 - age / LASER_DECAY_MS; // 1.0 (head) -> 0.0 (tail)
+
+        // Draw glowing laser trail segment
+        const radius = Math.max(2, (currentSize + 2) * progress);
+        dynamicCtx.beginPath();
+        dynamicCtx.arc(p.x, p.y, radius, 0, Math.PI * 2);
+        dynamicCtx.fillStyle = `rgba(${hexToRgb(currentColor)}, ${progress * 0.85})`;
+        dynamicCtx.shadowColor = currentColor;
+        dynamicCtx.shadowBlur = 12 * progress;
+        dynamicCtx.fill();
+      }
+
+      // Draw high-intensity glowing head
+      const head = laserTrail[laserTrail.length - 1];
+      dynamicCtx.beginPath();
+      dynamicCtx.arc(head.x, head.y, currentSize + 4, 0, Math.PI * 2);
+      dynamicCtx.fillStyle = "#FFFFFF";
+      dynamicCtx.shadowColor = currentColor;
+      dynamicCtx.shadowBlur = 20;
+      dynamicCtx.fill();
+
+      dynamicCtx.beginPath();
+      dynamicCtx.arc(head.x, head.y, currentSize + 1, 0, Math.PI * 2);
+      dynamicCtx.fillStyle = currentColor;
+      dynamicCtx.fill();
+
+      laserRafId = requestAnimationFrame(renderLaserLoop);
+    } else {
+      dynamicRafReset();
+    }
+  }
+
+  function dynamicRafReset() {
+    laserRafId = null;
+    if (dynamicCtx && !isDrawing) {
+      dynamicCtx.clearRect(0, 0, window.innerWidth, window.innerHeight);
+    }
+  }
+
+  function hexToRgb(hex: string): string {
+    const clean = hex.replace("#", "");
+    const bigint = parseInt(clean, 16);
+    const r = (bigint >> 16) & 255;
+    const g = (bigint >> 8) & 255;
+    const b = bigint & 255;
+    return `${r}, ${g}, ${b}`;
+  }
+
+  // --- MOUSE & DRAWING HANDLERS ---
+  function onPointerDown(e: PointerEvent) {
+    if (isGhostMode) return;
+    // Don't draw if interacting with widget
+    const target = e.target as HTMLElement;
+    if (target && target.closest(".widget-container")) return;
+
+    isDrawing = true;
+    startPoint = { x: e.clientX, y: e.clientY };
+
+    if (currentTool === "laser") {
+      updateLaserTrail(e.clientX, e.clientY);
+    } else if (currentTool === "pen" || currentTool === "highlighter") {
+      currentStrokePoints = [{ x: e.clientX, y: e.clientY }];
+    } else if (currentTool === "stamp") {
+      // Place stamp immediately
+      const stampItem: DrawItem = {
+        tool: "stamp",
+        color: currentColor,
+        size: currentSize,
+        start: { x: e.clientX, y: e.clientY },
+        stampNumber: stampCounter
+      };
+      history.push(stampItem);
+      stampCounter += 1;
+      redoStack = [];
+      redrawStaticCanvas();
+      isDrawing = false;
+    }
+  }
+
+  function onPointerMove(e: PointerEvent) {
+    if (currentTool === "laser") {
+      updateLaserTrail(e.clientX, e.clientY);
+      return;
+    }
+
+    if (!isDrawing || isGhostMode) return;
+
+    if (currentTool === "pen" || currentTool === "highlighter") {
+      currentStrokePoints.push({ x: e.clientX, y: e.clientY });
+      renderCurrentFreehand(dynamicCtx);
+    } else if (["arrow", "rect", "circle", "line"].includes(currentTool)) {
+      renderShapePreview(dynamicCtx, startPoint, { x: e.clientX, y: e.clientY }, currentTool);
+    }
+  }
+
+  function onPointerUp(e: PointerEvent) {
+    if (!isDrawing || isGhostMode) return;
+    isDrawing = false;
+
+    if (currentTool === "pen" || currentTool === "highlighter") {
+      if (currentStrokePoints.length > 0) {
+        history.push({
+          tool: currentTool,
+          color: currentColor,
+          size: currentTool === "highlighter" ? currentSize * 3.5 : currentSize,
+          points: [...currentStrokePoints]
+        });
+        redoStack = [];
+        currentStrokePoints = [];
+        dynamicCtx.clearRect(0, 0, window.innerWidth, window.innerHeight);
+        redrawStaticCanvas();
+      }
+    } else if (["arrow", "rect", "circle", "line"].includes(currentTool)) {
+      const endPoint = { x: e.clientX, y: e.clientY };
+      // Ignore tiny jitter clicks
+      const dist = Math.hypot(endPoint.x - startPoint.x, endPoint.y - startPoint.y);
+      if (dist > 5) {
+        history.push({
+          tool: currentTool,
+          color: currentColor,
+          size: currentSize,
+          start: { ...startPoint },
+          end: endPoint
+        });
+        redoStack = [];
+        dynamicCtx.clearRect(0, 0, window.innerWidth, window.innerHeight);
+        redrawStaticCanvas();
+      }
+    }
+  }
+
+  // --- VECTOR RENDERING ---
+  function renderCurrentFreehand(ctx: CanvasRenderingContext2D) {
+    ctx.clearRect(0, 0, window.innerWidth, window.innerHeight);
+    if (currentStrokePoints.length < 2) return;
+
+    ctx.save();
+    ctx.beginPath();
+    ctx.moveTo(currentStrokePoints[0].x, currentStrokePoints[0].y);
+
+    for (let i = 1; i < currentStrokePoints.length; i++) {
+      ctx.lineTo(currentStrokePoints[i].x, currentStrokePoints[i].y);
+    }
+
+    ctx.strokeStyle = currentColor;
+    ctx.lineWidth = currentTool === "highlighter" ? currentSize * 3.5 : currentSize;
+    ctx.lineCap = "round";
+    ctx.lineJoin = "round";
+
+    if (currentTool === "highlighter") {
+      ctx.globalAlpha = 0.38;
+      ctx.globalCompositeOperation = "source-over";
+    }
+
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  function renderShapePreview(
+    ctx: CanvasRenderingContext2D,
+    start: Point,
+    end: Point,
+    tool: Tool
+  ) {
+    ctx.clearRect(0, 0, window.innerWidth, window.innerHeight);
+    ctx.save();
+    ctx.strokeStyle = currentColor;
+    ctx.lineWidth = currentSize;
+    ctx.lineCap = "round";
+    ctx.lineJoin = "round";
+
+    drawSingleShape(ctx, tool, start, end, currentColor, currentSize);
+    ctx.restore();
+  }
+
+  function drawSingleShape(
+    ctx: CanvasRenderingContext2D,
+    tool: Tool,
+    start: Point,
+    end: Point,
+    color: string,
+    size: number
+  ) {
+    ctx.strokeStyle = color;
+    ctx.lineWidth = size;
+    ctx.lineCap = "round";
+    ctx.lineJoin = "round";
+
+    if (tool === "line") {
+      ctx.beginPath();
+      ctx.moveTo(start.x, start.y);
+      ctx.lineTo(end.x, end.y);
+      ctx.stroke();
+    } else if (tool === "rect") {
+      ctx.beginPath();
+      ctx.strokeRect(start.x, start.y, end.x - start.x, end.y - start.y);
+    } else if (tool === "circle") {
+      const radiusX = Math.abs(end.x - start.x) / 2;
+      const radiusY = Math.abs(end.y - start.y) / 2;
+      const centerX = Math.min(start.x, end.x) + radiusX;
+      const centerY = Math.min(start.y, end.y) + radiusY;
+      ctx.beginPath();
+      ctx.ellipse(centerX, centerY, radiusX, radiusY, 0, 0, Math.PI * 2);
+      ctx.stroke();
+    } else if (tool === "arrow") {
+      // Draw main line
+      ctx.beginPath();
+      ctx.moveTo(start.x, start.y);
+      ctx.lineTo(end.x, end.y);
+      ctx.stroke();
+
+      // Calculate arrowhead angle
+      const angle = Math.atan2(end.y - start.y, end.x - start.x);
+      const headLength = Math.max(16, size * 3.5);
+
+      ctx.beginPath();
+      ctx.moveTo(end.x, end.y);
+      ctx.lineTo(
+        end.x - headLength * Math.cos(angle - Math.PI / 6),
+        end.y - headLength * Math.sin(angle - Math.PI / 6)
+      );
+      ctx.moveTo(end.x, end.y);
+      ctx.lineTo(
+        end.x - headLength * Math.cos(angle + Math.PI / 6),
+        end.y - headLength * Math.sin(angle + Math.PI / 6)
+      );
+      ctx.stroke();
+    }
+  }
+
+  function redrawStaticCanvas() {
+    if (!staticCtx) return;
+    staticCtx.clearRect(0, 0, window.innerWidth, window.innerHeight);
+
+    for (const item of history) {
+      staticCtx.save();
+      if (item.tool === "pen" && item.points && item.points.length > 1) {
+        staticCtx.beginPath();
+        staticCtx.moveTo(item.points[0].x, item.points[0].y);
+        for (let i = 1; i < item.points.length; i++) {
+          staticCtx.lineTo(item.points[i].x, item.points[i].y);
+        }
+        staticCtx.strokeStyle = item.color;
+        staticCtx.lineWidth = item.size;
+        staticCtx.lineCap = "round";
+        staticCtx.lineJoin = "round";
+        staticCtx.stroke();
+      } else if (item.tool === "highlighter" && item.points && item.points.length > 1) {
+        staticCtx.beginPath();
+        staticCtx.moveTo(item.points[0].x, item.points[0].y);
+        for (let i = 1; i < item.points.length; i++) {
+          staticCtx.lineTo(item.points[i].x, item.points[i].y);
+        }
+        staticCtx.strokeStyle = item.color;
+        staticCtx.lineWidth = item.size;
+        staticCtx.lineCap = "round";
+        staticCtx.lineJoin = "round";
+        staticCtx.globalAlpha = 0.38;
+        staticCtx.stroke();
+      } else if (item.start && item.end) {
+        drawSingleShape(staticCtx, item.tool, item.start, item.end, item.color, item.size);
+      } else if (item.tool === "stamp" && item.start && item.stampNumber) {
+        // Draw circular numbered badge
+        const r = 16;
+        staticCtx.beginPath();
+        staticCtx.arc(item.start.x, item.start.y, r, 0, Math.PI * 2);
+        staticCtx.fillStyle = item.color;
+        staticCtx.shadowColor = "rgba(0,0,0,0.4)";
+        staticCtx.shadowBlur = 6;
+        staticCtx.fill();
+
+        staticCtx.shadowBlur = 0;
+        staticCtx.fillStyle = "#FFFFFF";
+        staticCtx.font = "bold 15px -apple-system, BlinkMacSystemFont, sans-serif";
+        staticCtx.textAlign = "center";
+        staticCtx.textBaseline = "middle";
+        staticCtx.fillText(String(item.stampNumber), item.start.x, item.start.y + 1);
+      }
+      staticCtx.restore();
+    }
+  }
+
+  // --- ACTIONS ---
+  function undo() {
+    if (history.length === 0) return;
+    const item = history.pop()!;
+    redoStack.push(item);
+    redrawStaticCanvas();
+  }
+
+  function redo() {
+    if (redoStack.length === 0) return;
+    const item = redoStack.pop()!;
+    history.push(item);
+    redrawStaticCanvas();
+  }
+
+  function clearCanvas() {
+    history = [];
+    redoStack = [];
+    stampCounter = 1;
+    if (staticCtx) staticCtx.clearRect(0, 0, window.innerWidth, window.innerHeight);
+    if (dynamicCtx) dynamicCtx.clearRect(0, 0, window.innerWidth, window.innerHeight);
+  }
+
+  async function toggleGhostMode() {
+    isGhostMode = !isGhostMode;
+    try {
+      await invoke("set_click_through", { ignore: isGhostMode });
+    } catch (err) {
+      console.error("Failed to toggle click through:", err);
+    }
+  }
+
+  async function onWidgetMouseEnter() {
+    if (isGhostMode) {
+      try {
+        await invoke("set_click_through", { ignore: false });
+      } catch (err) {}
+    }
+  }
+
+  async function onWidgetMouseLeave() {
+    if (isGhostMode) {
+      try {
+        await invoke("set_click_through", { ignore: true });
+      } catch (err) {}
+    }
+  }
+
+  // --- SHORTCUTS ---
+  function handleKeyDown(e: KeyboardEvent) {
+    if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
+
+    const key = e.key.toLowerCase();
+
+    if ((e.metaKey || e.ctrlKey) && key === "z") {
+      e.preventDefault();
+      if (e.shiftKey) {
+        redo();
+      } else {
+        undo();
+      }
+      return;
+    }
+
+    if ((e.metaKey || e.ctrlKey) && key === "y") {
+      e.preventDefault();
+      redo();
+      return;
+    }
+
+    if (e.key === "Escape") {
+      clearCanvas();
+      return;
+    }
+
+    if (key === "x") {
+      toggleGhostMode();
+      return;
+    }
+
+    if (key === "l" || key === "1") currentTool = "laser";
+    if (key === "p" || key === "2") currentTool = "pen";
+    if (key === "h" || key === "3") currentTool = "highlighter";
+    if (key === "a" || key === "4") currentTool = "arrow";
+    if (key === "r" || key === "5") currentTool = "rect";
+    if (key === "c" || key === "6") currentTool = "circle";
+    if (key === "s" || key === "7") currentTool = "stamp";
+
+    if (e.key === " ") {
+      e.preventDefault();
+      isCollapsed = !isCollapsed;
+    }
+  }
+
+  // --- FLOATING WIDGET DRAGGING & DOCKING ---
+  function onDragStart(e: MouseEvent) {
+    isDragging = true;
+    dragOffset = {
+      x: e.clientX - widgetX,
+      y: e.clientY - widgetY
+    };
+    window.addEventListener("mousemove", onDragMove);
+    window.addEventListener("mouseup", onDragEnd);
+  }
+
+  function onDragMove(e: MouseEvent) {
+    if (!isDragging) return;
+    widgetX = e.clientX - dragOffset.x;
+    widgetY = e.clientY - dragOffset.y;
+  }
+
+  function onDragEnd() {
+    isDragging = false;
+    window.removeEventListener("mousemove", onDragMove);
+    window.removeEventListener("mouseup", onDragEnd);
+
+    // Magnetic edge snapping (< 50px threshold)
+    const threshold = 50;
+    const w = window.innerWidth;
+    const h = window.innerHeight;
+
+    if (widgetX < threshold) {
+      widgetX = 12;
+      isDocked = true;
+      dockEdge = "left";
+    } else if (widgetX > w - 460 - threshold) {
+      widgetX = w - 470;
+      isDocked = true;
+      dockEdge = "right";
+    } else if (widgetY < threshold) {
+      widgetY = 12;
+      isDocked = true;
+      dockEdge = "top";
+    } else if (widgetY > h - 70 - threshold) {
+      widgetY = h - 70;
+      isDocked = true;
+      dockEdge = "bottom";
+    } else {
+      isDocked = false;
+    }
   }
 </script>
 
-<main class="container">
-  <h1>Welcome to Tauri + Svelte</h1>
+<!-- Global Transparent Drawing Surfaces -->
+<canvas
+  bind:this={staticCanvas}
+  class="canvas-layer"
+></canvas>
 
-  <div class="row">
-    <a href="https://vite.dev" target="_blank">
-      <img src="/vite.svg" class="logo vite" alt="Vite Logo" />
-    </a>
-    <a href="https://tauri.app" target="_blank">
-      <img src="/tauri.svg" class="logo tauri" alt="Tauri Logo" />
-    </a>
-    <a href="https://svelte.dev" target="_blank">
-      <img src="/svelte.svg" class="logo svelte-kit" alt="SvelteKit Logo" />
-    </a>
-  </div>
-  <p>Click on the Tauri, Vite, and SvelteKit logos to learn more.</p>
+<canvas
+  bind:this={dynamicCanvas}
+  class="canvas-layer"
+  onpointerdown={onPointerDown}
+  onpointermove={onPointerMove}
+  onpointerup={onPointerUp}
+></canvas>
 
-  <form class="row" onsubmit={greet}>
-    <input id="greet-input" placeholder="Enter a name..." bind:value={name} />
-    <button type="submit">Greet</button>
-  </form>
-  <p>{greetMsg}</p>
-</main>
+<!-- Floating Edge-Docking Widget Container -->
+<div
+  class="widget-container"
+  class:docked={isDocked}
+  class:collapsed={isCollapsed}
+  style="transform: translate({widgetX}px, {widgetY}px);"
+  role="region"
+  aria-label="PixelTrace Controls"
+  onmouseenter={onWidgetMouseEnter}
+  onmouseleave={onWidgetMouseLeave}
+>
+  {#if isCollapsed}
+    <!-- Collapsed Edge Pill (Tab) -->
+    <button
+      class="edge-pill"
+      onclick={() => (isCollapsed = false)}
+      title="Expand PixelTrace Toolbar (Space)"
+    >
+      <span class="pill-glow" style="background-color: {currentColor}"></span>
+      <span class="pill-label">PT</span>
+    </button>
+  {:else}
+    <!-- Expanded Floating Glassmorphic Toolbar -->
+    <div class="glass-bar">
+      <!-- Drag Handle -->
+      <div
+        class="drag-handle"
+        onmousedown={onDragStart}
+        role="button"
+        tabindex="0"
+        title="Drag toolbar anywhere (Snap to edges)"
+      >
+        <svg width="14" height="20" viewBox="0 0 14 20" fill="currentColor">
+          <circle cx="4" cy="4" r="1.5" />
+          <circle cx="10" cy="4" r="1.5" />
+          <circle cx="4" cy="10" r="1.5" />
+          <circle cx="10" cy="10" r="1.5" />
+          <circle cx="4" cy="16" r="1.5" />
+          <circle cx="10" cy="16" r="1.5" />
+        </svg>
+      </div>
+
+      <!-- Divider -->
+      <div class="divider"></div>
+
+      <!-- Tools Group -->
+      <div class="btn-group">
+        <!-- Laser Pointer -->
+        <button
+          class="tool-btn"
+          class:active={currentTool === "laser"}
+          onclick={() => (currentTool = "laser")}
+          title="Laser Pointer (L or 1)"
+        >
+          <span class="laser-dot" style="background-color: {currentColor}"></span>
+          <span class="label">Laser</span>
+        </button>
+
+        <!-- Pen -->
+        <button
+          class="tool-btn"
+          class:active={currentTool === "pen"}
+          onclick={() => (currentTool = "pen")}
+          title="Pen (P or 2)"
+        >
+          ✏️
+        </button>
+
+        <!-- Highlighter -->
+        <button
+          class="tool-btn"
+          class:active={currentTool === "highlighter"}
+          onclick={() => (currentTool = "highlighter")}
+          title="Highlighter (H or 3)"
+        >
+          🖍️
+        </button>
+
+        <!-- Arrow -->
+        <button
+          class="tool-btn"
+          class:active={currentTool === "arrow"}
+          onclick={() => (currentTool = "arrow")}
+          title="Arrow (A or 4)"
+        >
+          ↗️
+        </button>
+
+        <!-- Rectangle -->
+        <button
+          class="tool-btn"
+          class:active={currentTool === "rect"}
+          onclick={() => (currentTool = "rect")}
+          title="Rectangle (R or 5)"
+        >
+          🔲
+        </button>
+
+        <!-- Circle -->
+        <button
+          class="tool-btn"
+          class:active={currentTool === "circle"}
+          onclick={() => (currentTool = "circle")}
+          title="Circle (C or 6)"
+        >
+          ⭕
+        </button>
+
+        <!-- Numbered Stamp -->
+        <button
+          class="tool-btn stamp-btn"
+          class:active={currentTool === "stamp"}
+          onclick={() => (currentTool = "stamp")}
+          oncontextmenu={(e) => {
+            e.preventDefault();
+            stampCounter = 1;
+          }}
+          title="Numbered Stamp (S or 7). Right-click to reset #{stampCounter}"
+        >
+          <span class="stamp-badge">{stampCounter}</span>
+        </button>
+      </div>
+
+      <div class="divider"></div>
+
+      <!-- Color Palette -->
+      <div class="color-palette">
+        {#each colors as c}
+          <button
+            class="color-chip"
+            class:active={currentColor === c.hex}
+            style="background-color: {c.hex}"
+            onclick={() => (currentColor = c.hex)}
+            title={c.name}
+          ></button>
+        {/each}
+      </div>
+
+      <div class="divider"></div>
+
+      <!-- History & Clear -->
+      <div class="btn-group">
+        <button
+          class="icon-btn"
+          disabled={history.length === 0}
+          onclick={undo}
+          title="Undo (Ctrl/Cmd+Z)"
+        >
+          ↩️
+        </button>
+
+        <button
+          class="icon-btn"
+          disabled={redoStack.length === 0}
+          onclick={redo}
+          title="Redo (Ctrl/Cmd+Y)"
+        >
+          ↪️
+        </button>
+
+        <button
+          class="icon-btn danger"
+          onclick={clearCanvas}
+          title="Clear Screen (Esc)"
+        >
+          🗑️
+        </button>
+      </div>
+
+      <div class="divider"></div>
+
+      <!-- Ghost Mode (Click-Through) -->
+      <button
+        class="ghost-btn"
+        class:active={isGhostMode}
+        onclick={toggleGhostMode}
+        title="Ghost Mode (X) — Pass clicks through to apps below"
+      >
+        {isGhostMode ? "👻 Ghost" : "👁️ Draw"}
+      </button>
+
+      <!-- Collapse / Dock Button -->
+      <button
+        class="collapse-btn"
+        onclick={() => (isCollapsed = true)}
+        title="Collapse into edge drawer tab (Space)"
+      >
+        ◀
+      </button>
+    </div>
+  {/if}
+</div>
 
 <style>
-.logo.vite:hover {
-  filter: drop-shadow(0 0 2em #747bff);
-}
-
-.logo.svelte-kit:hover {
-  filter: drop-shadow(0 0 2em #ff3e00);
-}
-
-:root {
-  font-family: Inter, Avenir, Helvetica, Arial, sans-serif;
-  font-size: 16px;
-  line-height: 24px;
-  font-weight: 400;
-
-  color: #0f0f0f;
-  background-color: #f6f6f6;
-
-  font-synthesis: none;
-  text-rendering: optimizeLegibility;
-  -webkit-font-smoothing: antialiased;
-  -moz-osx-font-smoothing: grayscale;
-  -webkit-text-size-adjust: 100%;
-}
-
-.container {
-  margin: 0;
-  padding-top: 10vh;
-  display: flex;
-  flex-direction: column;
-  justify-content: center;
-  text-align: center;
-}
-
-.logo {
-  height: 6em;
-  padding: 1.5em;
-  will-change: filter;
-  transition: 0.75s;
-}
-
-.logo.tauri:hover {
-  filter: drop-shadow(0 0 2em #24c8db);
-}
-
-.row {
-  display: flex;
-  justify-content: center;
-}
-
-a {
-  font-weight: 500;
-  color: #646cff;
-  text-decoration: inherit;
-}
-
-a:hover {
-  color: #535bf2;
-}
-
-h1 {
-  text-align: center;
-}
-
-input,
-button {
-  border-radius: 8px;
-  border: 1px solid transparent;
-  padding: 0.6em 1.2em;
-  font-size: 1em;
-  font-weight: 500;
-  font-family: inherit;
-  color: #0f0f0f;
-  background-color: #ffffff;
-  transition: border-color 0.25s;
-  box-shadow: 0 2px 2px rgba(0, 0, 0, 0.2);
-}
-
-button {
-  cursor: pointer;
-}
-
-button:hover {
-  border-color: #396cd8;
-}
-button:active {
-  border-color: #396cd8;
-  background-color: #e8e8e8;
-}
-
-input,
-button {
-  outline: none;
-}
-
-#greet-input {
-  margin-right: 5px;
-}
-
-@media (prefers-color-scheme: dark) {
-  :root {
-    color: #f6f6f6;
-    background-color: #2f2f2f;
+  :global(body) {
+    margin: 0;
+    padding: 0;
+    width: 100vw;
+    height: 100vh;
+    overflow: hidden;
+    background: transparent !important;
+    user-select: none;
+    -webkit-user-select: none;
   }
 
-  a:hover {
-    color: #24c8db;
+  .canvas-layer {
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 100vw;
+    height: 100vh;
+    pointer-events: auto;
+    z-index: 10;
   }
 
-  input,
-  button {
+  /* Floating Glassmorphic Container */
+  .widget-container {
+    position: fixed;
+    top: 0;
+    left: 0;
+    z-index: 999999;
+    pointer-events: auto;
+    transition: transform 0.08s ease-out;
+    filter: drop-shadow(0 12px 28px rgba(0, 0, 0, 0.45));
+  }
+
+  .widget-container.collapsed {
+    transition: transform 0.25s cubic-bezier(0.16, 1, 0.3, 1);
+  }
+
+  /* Sleek Collapsed Edge Pill */
+  .edge-pill {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 8px 14px;
+    background: rgba(18, 18, 22, 0.88);
+    backdrop-filter: blur(20px);
+    -webkit-backdrop-filter: blur(20px);
+    border: 1px solid rgba(255, 255, 255, 0.16);
+    border-radius: 24px;
     color: #ffffff;
-    background-color: #0f0f0f98;
+    cursor: pointer;
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+    transition: transform 0.15s ease, background-color 0.15s;
   }
-  button:active {
-    background-color: #0f0f0f69;
-  }
-}
 
+  .edge-pill:hover {
+    transform: scale(1.06);
+    background: rgba(28, 28, 34, 0.95);
+  }
+
+  .pill-glow {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    box-shadow: 0 0 10px currentColor;
+  }
+
+  .pill-label {
+    font-size: 13px;
+    font-weight: 700;
+    letter-spacing: 0.5px;
+  }
+
+  /* Glassmorphic Full Toolbar */
+  .glass-bar {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    padding: 6px 10px;
+    background: rgba(22, 22, 26, 0.82);
+    backdrop-filter: blur(24px) saturate(180%);
+    -webkit-backdrop-filter: blur(24px) saturate(180%);
+    border: 1px solid rgba(255, 255, 255, 0.14);
+    border-radius: 16px;
+    color: #ececed;
+  }
+
+  .drag-handle {
+    cursor: grab;
+    padding: 6px 4px;
+    color: rgba(255, 255, 255, 0.4);
+    display: flex;
+    align-items: center;
+    transition: color 0.15s;
+  }
+
+  .drag-handle:hover {
+    color: rgba(255, 255, 255, 0.9);
+  }
+
+  .divider {
+    width: 1px;
+    height: 22px;
+    background: rgba(255, 255, 255, 0.12);
+    margin: 0 2px;
+  }
+
+  .btn-group {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+  }
+
+  .tool-btn {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    padding: 6px 9px;
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: 10px;
+    color: #e0e0e0;
+    font-size: 14px;
+    cursor: pointer;
+    transition: background 0.15s, border-color 0.15s;
+  }
+
+  .tool-btn:hover {
+    background: rgba(255, 255, 255, 0.08);
+  }
+
+  .tool-btn.active {
+    background: rgba(255, 255, 255, 0.16);
+    border-color: rgba(255, 255, 255, 0.28);
+    color: #ffffff;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
+  }
+
+  .laser-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    box-shadow: 0 0 8px currentColor;
+  }
+
+  .stamp-btn {
+    padding: 4px 8px;
+  }
+
+  .stamp-badge {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 20px;
+    height: 20px;
+    background: #007aff;
+    color: white;
+    font-weight: bold;
+    font-size: 11px;
+    border-radius: 50%;
+  }
+
+  /* Color Palette Chips */
+  .color-palette {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+  }
+
+  .color-chip {
+    width: 17px;
+    height: 17px;
+    border-radius: 50%;
+    border: 2px solid transparent;
+    cursor: pointer;
+    padding: 0;
+    transition: transform 0.15s, border-color 0.15s;
+  }
+
+  .color-chip:hover {
+    transform: scale(1.15);
+  }
+
+  .color-chip.active {
+    transform: scale(1.25);
+    border-color: #ffffff;
+    box-shadow: 0 0 10px rgba(255, 255, 255, 0.6);
+  }
+
+  .icon-btn {
+    padding: 6px 8px;
+    background: transparent;
+    border: none;
+    border-radius: 8px;
+    cursor: pointer;
+    font-size: 13px;
+    color: #e0e0e0;
+    transition: background 0.15s;
+  }
+
+  .icon-btn:hover:not(:disabled) {
+    background: rgba(255, 255, 255, 0.08);
+  }
+
+  .icon-btn:disabled {
+    opacity: 0.3;
+    cursor: not-allowed;
+  }
+
+  .icon-btn.danger:hover {
+    background: rgba(255, 59, 48, 0.25);
+  }
+
+  /* Ghost Mode Toggle */
+  .ghost-btn {
+    padding: 5px 10px;
+    background: rgba(255, 255, 255, 0.07);
+    border: 1px solid rgba(255, 255, 255, 0.15);
+    border-radius: 10px;
+    color: #e0e0e0;
+    font-size: 12px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.15s;
+  }
+
+  .ghost-btn:hover {
+    background: rgba(255, 255, 255, 0.14);
+  }
+
+  .ghost-btn.active {
+    background: #af52de;
+    border-color: #af52de;
+    color: #ffffff;
+    box-shadow: 0 0 12px rgba(175, 82, 222, 0.6);
+  }
+
+  .collapse-btn {
+    background: transparent;
+    border: none;
+    color: rgba(255, 255, 255, 0.5);
+    cursor: pointer;
+    padding: 4px 6px;
+    font-size: 11px;
+    border-radius: 6px;
+    transition: color 0.15s;
+  }
+
+  .collapse-btn:hover {
+    color: #ffffff;
+    background: rgba(255, 255, 255, 0.08);
+  }
 </style>
