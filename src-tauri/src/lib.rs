@@ -18,7 +18,6 @@ pub struct InteractiveRect {
 static IS_GHOST_MODE: AtomicBool = AtomicBool::new(false);
 static INTERACTIVE_RECTS: Mutex<Vec<InteractiveRect>> = Mutex::new(Vec::new());
 
-#[cfg(target_os = "macos")]
 static CURRENTLY_IGNORING: AtomicBool = AtomicBool::new(false);
 
 #[cfg(target_os = "macos")]
@@ -43,7 +42,7 @@ extern "C" {
 }
 
 #[cfg(target_os = "macos")]
-fn get_global_cursor_pos() -> Option<CGPoint> {
+fn get_global_cursor_pos() -> Option<(f64, f64)> {
     unsafe {
         let event = CGEventCreate(std::ptr::null_mut());
         if event.is_null() {
@@ -51,8 +50,36 @@ fn get_global_cursor_pos() -> Option<CGPoint> {
         }
         let pt = CGEventGetLocation(event);
         CFRelease(event as *mut std::ffi::c_void);
-        Some(pt)
+        Some((pt.x, pt.y))
     }
+}
+
+#[cfg(target_os = "windows")]
+#[repr(C)]
+struct POINT {
+    x: i32,
+    y: i32,
+}
+
+#[cfg(target_os = "windows")]
+extern "system" {
+    fn GetCursorPos(lpPoint: *mut POINT) -> i32;
+}
+
+#[cfg(target_os = "windows")]
+fn get_global_cursor_pos() -> Option<(f64, f64)> {
+    let mut pt = POINT { x: 0, y: 0 };
+    let success = unsafe { GetCursorPos(&mut pt) };
+    if success != 0 {
+        Some((pt.x as f64, pt.y as f64))
+    } else {
+        None
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn get_global_cursor_pos() -> Option<(f64, f64)> {
+    None
 }
 
 #[cfg(target_os = "macos")]
@@ -105,8 +132,7 @@ fn setup_macos_dock_and_process() {
     }
 }
 
-#[cfg(target_os = "macos")]
-fn start_macos_mouse_monitor(app_handle: AppHandle) {
+fn start_mouse_monitor(app_handle: AppHandle) {
     std::thread::spawn(move || {
         loop {
             std::thread::sleep(std::time::Duration::from_millis(25));
@@ -125,8 +151,8 @@ fn start_macos_mouse_monitor(app_handle: AppHandle) {
                 continue;
             }
 
-            // In Ghost Mode: query CoreGraphics global mouse location
-            let cursor = match get_global_cursor_pos() {
+            // In Ghost Mode: query global cursor location
+            let (cursor_x, cursor_y) = match get_global_cursor_pos() {
                 Some(pt) => pt,
                 None => continue,
             };
@@ -138,8 +164,8 @@ fn start_macos_mouse_monitor(app_handle: AppHandle) {
             let scale_factor = win.scale_factor().unwrap_or(1.0);
 
             // Convert physical screen coordinates to window-relative logical CSS pixels
-            let rel_x = cursor.x - (win_pos.x as f64 / scale_factor);
-            let rel_y = cursor.y - (win_pos.y as f64 / scale_factor);
+            let rel_x = cursor_x - (win_pos.x as f64 / scale_factor);
+            let rel_y = cursor_y - (win_pos.y as f64 / scale_factor);
 
             let mut inside_interactive = false;
             if let Ok(rects) = INTERACTIVE_RECTS.lock() {
@@ -360,8 +386,9 @@ pub fn run() {
             {
                 app.set_activation_policy(tauri::ActivationPolicy::Regular);
                 setup_macos_dock_and_process();
-                start_macos_mouse_monitor(app.handle().clone());
             }
+
+            start_mouse_monitor(app.handle().clone());
 
             if let Some(window) = app.get_webview_window("main") {
                 // Determine primary monitor bounds to cover entire screen without native fullscreen mode
