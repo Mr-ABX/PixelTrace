@@ -1064,10 +1064,9 @@
 
     // Toolbar or Collapsed Tab rect
     if (isCollapsed) {
-      const tabW = 56;
+      const tabW = 60;
       const tabH = 68;
-      const x = dockSide === "left" ? 0 : Math.max(0, window.innerWidth - tabW);
-      rects.push({ x, y: widgetY, width: tabW, height: tabH });
+      rects.push({ x: 0, y: widgetY, width: tabW, height: tabH });
     } else if (toolbarRef) {
       rects.push({
         x: widgetX,
@@ -1111,32 +1110,21 @@
   }
 
   function collapseToNearestEdge() {
-    const w = window.innerWidth;
-    const barWidth = toolbarRef ? toolbarRef.offsetWidth : 940;
-    const centerX = widgetX + barWidth / 2;
-
-    lastFloatingX = widgetX;
-    lastFloatingY = widgetY;
-
-    if (centerX < w / 2) {
-      dockSide = "left";
-      widgetX = 0;
-    } else {
-      dockSide = "right";
-      widgetX = Math.max(0, w - 56);
-    }
-
+    // Strictly lock flush against the left wall
+    dockSide = "left";
+    widgetX = 0;
     widgetY = Math.max(24, Math.min(window.innerHeight - 90, widgetY));
     isCollapsed = true;
     tick().then(updateInteractiveRects);
   }
 
   function expandFromEdge() {
+    isCollapsed = false;
     const w = window.innerWidth;
     const barWidth = toolbarRef ? toolbarRef.offsetWidth : 940;
 
-    isCollapsed = false;
-    widgetX = Math.max(16, Math.round((w - barWidth) / 2));
+    // Pull out straight from left wall directly into exact top-center of the screen
+    widgetX = Math.max(16, Math.min(w - barWidth - 16, Math.round((w - barWidth) / 2)));
     widgetY = 20;
     tick().then(updateInteractiveRects);
   }
@@ -1165,18 +1153,12 @@
 
   function onCollapsedTabDragMove(e: MouseEvent) {
     if (!isDragging) return;
-    const w = window.innerWidth;
     const h = window.innerHeight;
 
+    // Strictly keep collapsed tab flush against the left wall
+    dockSide = "left";
+    widgetX = 0;
     widgetY = Math.max(16, Math.min(h - 84, e.clientY - dragOffset.y));
-
-    if (e.clientX < w / 2) {
-      dockSide = "left";
-      widgetX = 0;
-    } else {
-      dockSide = "right";
-      widgetX = Math.max(0, w - 56);
-    }
     updateInteractiveRects();
   }
 
@@ -1185,12 +1167,8 @@
     window.removeEventListener("mousemove", onCollapsedTabDragMove);
     window.removeEventListener("mouseup", onCollapsedTabDragEnd);
 
-    const w = window.innerWidth;
-    if (dockSide === "left") {
-      widgetX = 0;
-    } else {
-      widgetX = Math.max(0, w - 56);
-    }
+    dockSide = "left";
+    widgetX = 0;
     updateInteractiveRects();
   }
 
@@ -1481,34 +1459,30 @@
   aria-label="PixelTrace Screen Toolbar"
 >
   {#if isCollapsed}
-    <!-- Docked Edge Tab (Half-Pill matching screenshot) -->
+    <!-- Docked Left Edge Tab (Half-Pill sticking flush to left wall) -->
     <button
       bind:this={collapsedTabRef}
-      class="edge-dock-tab dock-{dockSide}"
+      class="edge-dock-tab dock-left"
       onclick={expandFromEdge}
       onmousedown={onCollapsedTabDragStart}
-      title="Click to expand PixelTrace (or drag along screen edge)"
+      title="Click to expand PixelTrace to center (or drag along left wall)"
       aria-label="Expand PixelTrace Toolbar"
     >
-      {#if dockSide === "right"}
-        <div class="dock-chevron">
-          <ChevronLeft size={16} />
-        </div>
-        <div class="dock-logo-badge" style="background-color: {currentColor}">
-          <Sparkles size={14} color="#ffffff" />
-        </div>
-      {:else}
-        <div class="dock-logo-badge" style="background-color: {currentColor}">
-          <Sparkles size={14} color="#ffffff" />
-        </div>
-        <div class="dock-chevron">
-          <ChevronRight size={16} />
-        </div>
-      {/if}
+      <div class="dock-logo-badge">
+        <img src="/app-logo.png" alt="PixelTrace" class="dock-app-logo" />
+      </div>
+      <div class="dock-chevron">
+        <ChevronRight size={16} />
+      </div>
     </button>
   {:else}
     <!-- Full Modern Glassmorphic Toolbar -->
     <div class="glass-bar">
+      <!-- App Brand Logo -->
+      <div class="bar-brand" title="PixelTrace Screen Annotator">
+        <img src="/app-logo.png" alt="PixelTrace Logo" class="bar-brand-logo" />
+      </div>
+
       <!-- Drag Handle -->
       <div
         class="drag-handle"
@@ -1799,7 +1773,7 @@
     >
       <div class="modal-header">
         <div class="modal-title">
-          <Sparkles size={18} />
+          <img src="/app-logo.png" alt="PixelTrace" class="modal-brand-logo" />
           <h3>PixelTrace Shortcuts</h3>
         </div>
         <button
@@ -2094,8 +2068,19 @@
     filter: drop-shadow(0 14px 36px rgba(0, 0, 0, 0.5));
   }
 
+  /* Floating Centered Toolbar Container */
+  .widget-container {
+    position: fixed;
+    top: 0;
+    left: 0;
+    z-index: 999999;
+    pointer-events: auto;
+    transition: transform 0.32s cubic-bezier(0.16, 1, 0.3, 1);
+    filter: drop-shadow(0 14px 36px rgba(0, 0, 0, 0.5));
+  }
+
   .widget-container.collapsed {
-    transition: transform 0.25s cubic-bezier(0.16, 1, 0.3, 1);
+    transition: transform 0.35s cubic-bezier(0.16, 1, 0.3, 1);
   }
 
   /* Sleek Edge-Docked Half-Pill Tab matching screenshot & Apple HIG */
@@ -2103,8 +2088,8 @@
     display: flex;
     align-items: center;
     gap: 8px;
-    padding: 10px 10px;
-    background: rgba(18, 18, 24, 0.88);
+    padding: 8px 10px 8px 6px;
+    background: rgba(18, 18, 24, 0.9);
     backdrop-filter: blur(28px) saturate(190%);
     -webkit-backdrop-filter: blur(28px) saturate(190%);
     border: 1px solid rgba(255, 255, 255, 0.16);
@@ -2117,16 +2102,6 @@
 
   .edge-dock-tab:active {
     cursor: grabbing;
-  }
-
-  .edge-dock-tab.dock-right {
-    border-top-left-radius: 32px;
-    border-bottom-left-radius: 32px;
-    border-top-right-radius: 0;
-    border-bottom-right-radius: 0;
-    border-right: none;
-    padding-left: 12px;
-    padding-right: 6px;
   }
 
   .edge-dock-tab.dock-left {
@@ -2144,10 +2119,6 @@
     border-color: rgba(255, 255, 255, 0.32);
   }
 
-  .edge-dock-tab.dock-right:hover {
-    transform: translateX(-4px) scale(1.03);
-  }
-
   .edge-dock-tab.dock-left:hover {
     transform: translateX(4px) scale(1.03);
   }
@@ -2160,13 +2131,50 @@
   }
 
   .dock-logo-badge {
-    width: 26px;
-    height: 26px;
-    border-radius: 50%;
     display: flex;
     align-items: center;
     justify-content: center;
-    box-shadow: 0 0 12px currentColor;
+  }
+
+  .dock-app-logo {
+    width: 28px;
+    height: 28px;
+    border-radius: 7px;
+    box-shadow: 0 0 12px rgba(0, 199, 190, 0.5);
+    display: block;
+    user-select: none;
+    -webkit-user-drag: none;
+    pointer-events: none;
+  }
+
+  /* Brand Logo in Toolbar */
+  .bar-brand {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0 4px 0 2px;
+  }
+
+  .bar-brand-logo {
+    width: 24px;
+    height: 24px;
+    border-radius: 6px;
+    box-shadow: 0 0 10px rgba(0, 199, 190, 0.45);
+    display: block;
+    user-select: none;
+    -webkit-user-drag: none;
+    pointer-events: none;
+  }
+
+  .modal-brand-logo {
+    width: 26px;
+    height: 26px;
+    border-radius: 7px;
+    box-shadow: 0 0 12px rgba(0, 199, 190, 0.5);
+    display: block;
+    user-select: none;
+    -webkit-user-drag: none;
+    pointer-events: none;
   }
 
   /* Ghost Mode Button */

@@ -298,7 +298,7 @@ pub fn run() {
             let _ = app.global_shortcut().register(shortcut_ghost_g);
 
             #[cfg(target_os = "macos")]
-            app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+            app.set_activation_policy(tauri::ActivationPolicy::Regular);
 
             if let Some(window) = app.get_webview_window("main") {
                 // Determine primary monitor bounds to cover entire screen without native fullscreen mode
@@ -332,6 +332,7 @@ pub fn run() {
 
             let _tray = TrayIconBuilder::new()
                 .icon(app.default_window_icon().unwrap().clone())
+                .icon_as_template(false)
                 .menu(&menu)
                 .show_menu_on_left_click(true)
                 .on_menu_event(|app, event| match event.id.as_ref() {
