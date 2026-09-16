@@ -163,6 +163,13 @@
   let lastFloatingX = $state(100);
   let lastFloatingY = $state(20);
 
+  // Popover Picker states & Tooltips
+  let showColorPicker = $state(false);
+  let showSizePicker = $state(false);
+  let colorPickerRef = $state<HTMLDivElement | null>(null);
+  let sizePickerRef = $state<HTMLDivElement | null>(null);
+  let hoveredTooltip = $state<{ label: string; shortcut?: string; x: number; y: number } | null>(null);
+
   // Stroke Size Presets
   const sizePresets = [
     { label: "Fine", val: 2 },
@@ -190,6 +197,7 @@
 
     window.addEventListener("resize", handleResize);
     window.addEventListener("keydown", handleKeyDown);
+    window.addEventListener("pointerdown", handleWindowClick);
 
     try {
       const savedNotes = localStorage.getItem("pixeltrace_sticky_notes");
@@ -230,6 +238,7 @@
     return () => {
       window.removeEventListener("resize", handleResize);
       window.removeEventListener("keydown", handleKeyDown);
+      window.removeEventListener("pointerdown", handleWindowClick);
       if (laserAnimFrame) cancelAnimationFrame(laserAnimFrame);
       if (unlistenGhost) unlistenGhost();
       if (unlistenClear) unlistenClear();
@@ -1066,6 +1075,62 @@
     if (dynamicCtx) dynamicCtx.clearRect(0, 0, window.innerWidth, window.innerHeight);
   }
 
+  function toggleColorPicker(e?: MouseEvent) {
+    e?.stopPropagation();
+    showColorPicker = !showColorPicker;
+    if (showColorPicker) showSizePicker = false;
+    hideTooltip();
+    tick().then(updateInteractiveRects);
+  }
+
+  function toggleSizePicker(e?: MouseEvent) {
+    e?.stopPropagation();
+    showSizePicker = !showSizePicker;
+    if (showSizePicker) showColorPicker = false;
+    hideTooltip();
+    tick().then(updateInteractiveRects);
+  }
+
+  function closePickers() {
+    if (showColorPicker || showSizePicker) {
+      showColorPicker = false;
+      showSizePicker = false;
+      tick().then(updateInteractiveRects);
+    }
+  }
+
+  function handleWindowClick(e: MouseEvent) {
+    if (showColorPicker || showSizePicker) {
+      const target = e.target as HTMLElement;
+      if (
+        !target.closest(".color-popover") &&
+        !target.closest(".color-trigger-btn") &&
+        !target.closest(".size-popover") &&
+        !target.closest(".size-trigger-btn")
+      ) {
+        closePickers();
+      }
+    }
+  }
+
+  function showTooltip(e: MouseEvent, label: string, shortcut?: string) {
+    if (isCollapsed) return;
+    const el = e.currentTarget as HTMLElement;
+    if (!el) return;
+    const rect = el.getBoundingClientRect();
+    const y = rect.bottom + 8 < window.innerHeight - 40 ? rect.bottom + 8 : rect.top - 32;
+    hoveredTooltip = {
+      label,
+      shortcut,
+      x: rect.left + rect.width / 2,
+      y
+    };
+  }
+
+  function hideTooltip() {
+    hoveredTooltip = null;
+  }
+
   function updateInteractiveRects() {
     const rects: InteractiveRect[] = [];
 
@@ -1078,9 +1143,19 @@
       rects.push({
         x: widgetX,
         y: widgetY,
-        width: toolbarRef.offsetWidth || 940,
+        width: toolbarRef.offsetWidth || 780,
         height: toolbarRef.offsetHeight || 54
       });
+
+      // Popover rects if open
+      if (showColorPicker && colorPickerRef) {
+        const cr = colorPickerRef.getBoundingClientRect();
+        rects.push({ x: cr.left, y: cr.top, width: cr.width, height: cr.height });
+      }
+      if (showSizePicker && sizePickerRef) {
+        const sr = sizePickerRef.getBoundingClientRect();
+        rects.push({ x: sr.left, y: sr.top, width: sr.width, height: sr.height });
+      }
     }
 
     // Sticky notes rects
@@ -1117,6 +1192,7 @@
   }
 
   function collapseToNearestEdge() {
+    closePickers();
     // Strictly lock flush against the left wall
     dockSide = "left";
     widgetX = 0;
@@ -1266,6 +1342,10 @@
     }
 
     if (e.key === "Escape") {
+      if (showColorPicker || showSizePicker) {
+        closePickers();
+        return;
+      }
       if (showHelpModal) {
         showHelpModal = false;
         tick().then(updateInteractiveRects);
@@ -1475,7 +1555,8 @@
       class="edge-dock-tab dock-left"
       onclick={expandFromEdge}
       onmousedown={onCollapsedTabDragStart}
-      title="Click to expand PixelTrace to center (or drag along left wall)"
+      onmouseenter={(e) => showTooltip(e, "Expand PixelTrace", "Space")}
+      onmouseleave={hideTooltip}
       aria-label="Expand PixelTrace Toolbar"
     >
       <div class="dock-logo-badge">
@@ -1489,7 +1570,12 @@
     <!-- Full Modern Glassmorphic Toolbar -->
     <div class="glass-bar">
       <!-- App Brand Logo -->
-      <div class="bar-brand" title="PixelTrace Screen Annotator">
+      <div
+        class="bar-brand"
+        onmouseenter={(e) => showTooltip(e, "PixelTrace Screen Annotator")}
+        onmouseleave={hideTooltip}
+        role="presentation"
+      >
         <img src="/app-logo.png" alt="PixelTrace Logo" class="bar-brand-logo" />
       </div>
 
@@ -1497,9 +1583,11 @@
       <div
         class="drag-handle"
         onmousedown={onDragStart}
+        onmouseenter={(e) => showTooltip(e, "Drag Toolbar")}
+        onmouseleave={hideTooltip}
         role="button"
         tabindex="0"
-        title="Drag toolbar anywhere"
+        aria-label="Drag toolbar"
       >
         <GripVertical size={16} />
       </div>
@@ -1513,7 +1601,9 @@
           class="tool-btn"
           class:active={currentTool === "laser"}
           onclick={() => (currentTool = "laser")}
-          title="Laser Pointer (L or 1) — Continuous glowing trail"
+          onmouseenter={(e) => showTooltip(e, "Laser Pointer", "L / 1")}
+          onmouseleave={hideTooltip}
+          aria-label="Laser Pointer"
         >
           <Sparkles size={17} />
           <span class="laser-indicator" style="background-color: {currentColor}"></span>
@@ -1524,7 +1614,9 @@
           class="tool-btn"
           class:active={currentTool === "pen"}
           onclick={() => (currentTool = "pen")}
-          title="Smooth Pen (P or 2)"
+          onmouseenter={(e) => showTooltip(e, "Smooth Pen", "P / 2")}
+          onmouseleave={hideTooltip}
+          aria-label="Smooth Pen"
         >
           <Pencil size={17} />
         </button>
@@ -1534,7 +1626,9 @@
           class="tool-btn"
           class:active={currentTool === "highlighter"}
           onclick={() => (currentTool = "highlighter")}
-          title="Highlighter (H or 3)"
+          onmouseenter={(e) => showTooltip(e, "Highlighter", "H / 3")}
+          onmouseleave={hideTooltip}
+          aria-label="Highlighter"
         >
           <Highlighter size={17} />
         </button>
@@ -1544,7 +1638,9 @@
           class="tool-btn"
           class:active={currentTool === "arrow"}
           onclick={() => (currentTool = "arrow")}
-          title="Arrow (A or 4)"
+          onmouseenter={(e) => showTooltip(e, "Arrow Tool", "A / 4")}
+          onmouseleave={hideTooltip}
+          aria-label="Arrow Tool"
         >
           <ArrowUpRight size={18} />
         </button>
@@ -1554,7 +1650,9 @@
           class="tool-btn"
           class:active={currentTool === "rect"}
           onclick={() => (currentTool = "rect")}
-          title="Rectangle (R or 5)"
+          onmouseenter={(e) => showTooltip(e, "Rectangle", "R / 5")}
+          onmouseleave={hideTooltip}
+          aria-label="Rectangle"
         >
           <Square size={16} />
         </button>
@@ -1564,7 +1662,9 @@
           class="tool-btn"
           class:active={currentTool === "circle"}
           onclick={() => (currentTool = "circle")}
-          title="Circle (C or 6)"
+          onmouseenter={(e) => showTooltip(e, "Circle", "C / 6")}
+          onmouseleave={hideTooltip}
+          aria-label="Circle"
         >
           <Circle size={16} />
         </button>
@@ -1574,7 +1674,9 @@
           class="tool-btn"
           class:active={currentTool === "line"}
           onclick={() => (currentTool = "line")}
-          title="Straight Line (I or 7)"
+          onmouseenter={(e) => showTooltip(e, "Straight Line", "I / 7")}
+          onmouseleave={hideTooltip}
+          aria-label="Straight Line"
         >
           <Slash size={16} />
         </button>
@@ -1584,7 +1686,9 @@
           class="tool-btn"
           class:active={currentTool === "text"}
           onclick={() => (currentTool = "text")}
-          title="Text Note (T or 9) — Click anywhere to write"
+          onmouseenter={(e) => showTooltip(e, "Text Note", "T / 9")}
+          onmouseleave={hideTooltip}
+          aria-label="Text Note"
         >
           <Type size={17} />
         </button>
@@ -1598,7 +1702,9 @@
             e.preventDefault();
             stampCounter = 1;
           }}
-          title="Numbered Stamp (S or 8). Right-click to reset #{stampCounter}"
+          onmouseenter={(e) => showTooltip(e, `Stamp #${stampCounter} (Right-click reset)`, "S / 8")}
+          onmouseleave={hideTooltip}
+          aria-label="Numbered Stamp"
         >
           <ListOrdered size={16} />
           <span class="stamp-badge">{stampCounter}</span>
@@ -1609,7 +1715,9 @@
           class="tool-btn"
           class:active={currentTool === "eraser"}
           onclick={() => (currentTool = "eraser")}
-          title="Eraser (E or 0) — Erase strokes & shapes"
+          onmouseenter={(e) => showTooltip(e, "Eraser", "E / 0")}
+          onmouseleave={hideTooltip}
+          aria-label="Eraser"
         >
           <Eraser size={16} />
         </button>
@@ -1619,7 +1727,9 @@
           class="tool-btn"
           class:active={currentTool === "sticky"}
           onclick={() => (currentTool = "sticky")}
-          title="Sticky Note (N) — Click anywhere to post a physical sticky note"
+          onmouseenter={(e) => showTooltip(e, "Sticky Note", "N")}
+          onmouseleave={hideTooltip}
+          aria-label="Sticky Note"
         >
           <StickyNote size={16} />
         </button>
@@ -1627,33 +1737,122 @@
 
       <div class="divider"></div>
 
-      <!-- Stroke Size Presets -->
-      <div class="size-group">
-        {#each sizePresets as s}
-          <button
-            class="size-chip"
-            class:active={currentSize === s.val}
-            onclick={() => (currentSize = s.val)}
-            title="{s.label} stroke ({s.val}px)"
+      <!-- Stroke Size Compact Trigger & Popover -->
+      <div class="popover-anchor">
+        <button
+          class="size-trigger-btn"
+          class:active={showSizePicker}
+          onclick={toggleSizePicker}
+          onmouseenter={(e) => showTooltip(e, "Stroke Width", `${currentSize}px`)}
+          onmouseleave={hideTooltip}
+          aria-label="Stroke Width Picker"
+        >
+          <span class="size-dot-preview" style="width: {Math.max(4, Math.min(14, currentSize + 2))}px; height: {Math.max(4, Math.min(14, currentSize + 2))}px;"></span>
+          <span class="size-val-label">{currentSize}px</span>
+        </button>
+
+        {#if showSizePicker}
+          <div
+            bind:this={sizePickerRef}
+            class="popover-menu size-popover"
+            onmouseenter={onMouseEnterInteractive}
+            onmouseleave={onMouseLeaveInteractive}
+            role="region"
+            aria-label="Stroke Width Settings"
           >
-            <span class="size-dot" style="width: {s.val + 2}px; height: {s.val + 2}px;"></span>
-          </button>
-        {/each}
+            <div class="popover-header">
+              <span class="popover-title">Stroke Width</span>
+              <span class="popover-badge">{currentSize} px</span>
+            </div>
+
+            <div class="size-presets-grid">
+              {#each sizePresets as s}
+                <button
+                  class="size-preset-item"
+                  class:active={currentSize === s.val}
+                  onclick={() => {
+                    currentSize = s.val;
+                    showSizePicker = false;
+                    tick().then(updateInteractiveRects);
+                  }}
+                  title="{s.label} ({s.val}px)"
+                >
+                  <span class="size-dot" style="width: {s.val + 2}px; height: {s.val + 2}px;"></span>
+                  <span class="preset-label">{s.label}</span>
+                </button>
+              {/each}
+            </div>
+
+            <div class="slider-container">
+              <input
+                type="range"
+                min="1"
+                max="32"
+                step="1"
+                bind:value={currentSize}
+                class="stroke-range-slider"
+                aria-label="Adjust stroke width"
+              />
+            </div>
+          </div>
+        {/if}
       </div>
 
       <div class="divider"></div>
 
-      <!-- Color Palette -->
-      <div class="color-palette">
-        {#each colors as c}
-          <button
-            class="color-chip"
-            class:active={currentColor === c.hex}
-            style="background-color: {c.hex}"
-            onclick={() => (currentColor = c.hex)}
-            title={c.name}
-          ></button>
-        {/each}
+      <!-- Color Palette Compact Trigger & Popover -->
+      <div class="popover-anchor">
+        <button
+          class="color-trigger-btn"
+          class:active={showColorPicker}
+          onclick={toggleColorPicker}
+          onmouseenter={(e) => showTooltip(e, "Color Palette", currentColor)}
+          onmouseleave={hideTooltip}
+          aria-label="Color Palette"
+        >
+          <span class="active-color-swatch" style="background-color: {currentColor};"></span>
+        </button>
+
+        {#if showColorPicker}
+          <div
+            bind:this={colorPickerRef}
+            class="popover-menu color-popover"
+            onmouseenter={onMouseEnterInteractive}
+            onmouseleave={onMouseLeaveInteractive}
+            role="region"
+            aria-label="Color Palette Settings"
+          >
+            <div class="popover-header">
+              <span class="popover-title">Palette</span>
+              <label class="custom-color-btn" title="Choose Custom Color">
+                <input
+                  type="color"
+                  bind:value={currentColor}
+                  class="hidden-color-input"
+                />
+                <span class="custom-swatch" style="background-color: {currentColor};"></span>
+                <span class="custom-text">Custom</span>
+              </label>
+            </div>
+
+            <div class="color-swatches-grid">
+              {#each colors as c}
+                <button
+                  class="color-chip-pop"
+                  class:active={currentColor === c.hex}
+                  style="background-color: {c.hex}"
+                  onclick={() => {
+                    currentColor = c.hex;
+                    showColorPicker = false;
+                    tick().then(updateInteractiveRects);
+                  }}
+                  title={c.name}
+                  aria-label={c.name}
+                ></button>
+              {/each}
+            </div>
+          </div>
+        {/if}
       </div>
 
       <div class="divider"></div>
@@ -1664,7 +1863,9 @@
           class="icon-btn"
           disabled={history.length === 0}
           onclick={undo}
-          title="Undo (⌘Z)"
+          onmouseenter={(e) => showTooltip(e, "Undo", "⌘Z")}
+          onmouseleave={hideTooltip}
+          aria-label="Undo"
         >
           <Undo2 size={16} />
         </button>
@@ -1673,7 +1874,9 @@
           class="icon-btn"
           disabled={redoStack.length === 0}
           onclick={redo}
-          title="Redo (⌘⇧Z / ⌘Y)"
+          onmouseenter={(e) => showTooltip(e, "Redo", "⌘⇧Z")}
+          onmouseleave={hideTooltip}
+          aria-label="Redo"
         >
           <Redo2 size={16} />
         </button>
@@ -1681,7 +1884,9 @@
         <button
           class="icon-btn"
           onclick={captureSnapshot}
-          title="Copy Screenshot to Clipboard"
+          onmouseenter={(e) => showTooltip(e, "Copy Screenshot", "⌘⇧S")}
+          onmouseleave={hideTooltip}
+          aria-label="Copy Screenshot to Clipboard"
         >
           <Camera size={16} />
         </button>
@@ -1690,7 +1895,9 @@
           class="icon-btn"
           class:active={autoFadeEnabled}
           onclick={() => (autoFadeEnabled = !autoFadeEnabled)}
-          title="Auto-Fade Markups (3.5s): {autoFadeEnabled ? 'ON' : 'OFF'}"
+          onmouseenter={(e) => showTooltip(e, `Auto-Fade (${autoFadeEnabled ? 'ON' : 'OFF'})`, "F")}
+          onmouseleave={hideTooltip}
+          aria-label="Toggle Auto-Fade"
         >
           <Hourglass size={16} />
         </button>
@@ -1698,7 +1905,9 @@
         <button
           class="icon-btn danger"
           onclick={clearCanvas}
-          title="Clear Screen Markups (Esc)"
+          onmouseenter={(e) => showTooltip(e, "Clear Markups", "Esc")}
+          onmouseleave={hideTooltip}
+          aria-label="Clear Screen Markups"
         >
           <Trash2 size={16} />
         </button>
@@ -1714,7 +1923,9 @@
               class="mon-btn"
               class:active={activeMonitorIndex === idx}
               onclick={() => switchToMonitor(idx)}
-              title="Switch overlay to Monitor {idx + 1}"
+              onmouseenter={(e) => showTooltip(e, `Switch to Display ${idx + 1}`)}
+              onmouseleave={hideTooltip}
+              aria-label="Switch to Monitor {idx + 1}"
             >
               <Monitor size={12} />
               <span>{idx + 1}</span>
@@ -1729,7 +1940,9 @@
         class="ghost-btn"
         class:active={isGhostMode}
         onclick={toggleGhostMode}
-        title={isGhostMode ? "Ghost Mode Active — Click to return to Drawing Mode (⌘⇧X / ⌘⇧G / X)" : "Click to enable Ghost Mode (Click through to desktop apps)"}
+        onmouseenter={(e) => showTooltip(e, isGhostMode ? "Ghost Active (Drawing Locked)" : "Ghost Mode (Click-Through)", "⌘⇧X")}
+        onmouseleave={hideTooltip}
+        aria-label="Toggle Ghost Mode"
       >
         <Ghost size={16} />
         <div class="ghost-btn-text">
@@ -1744,7 +1957,9 @@
           showHelpModal = !showHelpModal;
           tick().then(updateInteractiveRects);
         }}
-        title="Keyboard Shortcuts & About"
+        onmouseenter={(e) => showTooltip(e, "Shortcuts & About", "?")}
+        onmouseleave={hideTooltip}
+        aria-label="Keyboard Shortcuts & About"
       >
         <Keyboard size={16} />
       </button>
@@ -1753,13 +1968,28 @@
       <button
         class="collapse-btn"
         onclick={collapseToNearestEdge}
-        title="Collapse & snap to screen edge (Space)"
+        onmouseenter={(e) => showTooltip(e, "Collapse to Left Edge", "Space")}
+        onmouseleave={hideTooltip}
+        aria-label="Collapse to screen edge"
       >
         <ChevronLeft size={16} />
       </button>
     </div>
   {/if}
 </div>
+
+<!-- Sleek Floating Tooltip Overlay -->
+{#if hoveredTooltip && !isCollapsed}
+  <div
+    class="custom-tooltip"
+    style="left: {hoveredTooltip.x}px; top: {hoveredTooltip.y}px;"
+  >
+    <span class="tooltip-title">{hoveredTooltip.label}</span>
+    {#if hoveredTooltip.shortcut}
+      <span class="tooltip-shortcut">{hoveredTooltip.shortcut}</span>
+    {/if}
+  </div>
+{/if}
 
 <!-- Shortcuts Modal -->
 {#if showHelpModal}
@@ -2150,7 +2380,7 @@
     width: 28px;
     height: 28px;
     border-radius: 7px;
-    box-shadow: 0 0 12px rgba(0, 199, 190, 0.5);
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.25);
     display: block;
     user-select: none;
     -webkit-user-drag: none;
@@ -2169,7 +2399,7 @@
     width: 24px;
     height: 24px;
     border-radius: 6px;
-    box-shadow: 0 0 10px rgba(0, 199, 190, 0.45);
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.25);
     display: block;
     user-select: none;
     -webkit-user-drag: none;
@@ -2180,7 +2410,7 @@
     width: 26px;
     height: 26px;
     border-radius: 7px;
-    box-shadow: 0 0 12px rgba(0, 199, 190, 0.5);
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.25);
     display: block;
     user-select: none;
     -webkit-user-drag: none;
@@ -2323,33 +2553,165 @@
     border-radius: 50%;
   }
 
-  /* Stroke Size Presets */
-  .size-group {
+  /* Popover Anchor & Menus */
+  .popover-anchor {
+    position: relative;
     display: flex;
     align-items: center;
-    gap: 3px;
   }
 
-  .size-chip {
-    width: 22px;
-    height: 22px;
+  .size-trigger-btn {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    height: 32px;
+    padding: 0 8px;
+    background: rgba(255, 255, 255, 0.07);
+    border: 1px solid rgba(255, 255, 255, 0.15);
+    border-radius: 8px;
+    color: #e5e5ea;
+    cursor: pointer;
+    transition: all 0.15s ease;
+  }
+
+  .size-trigger-btn:hover,
+  .size-trigger-btn.active {
+    background: rgba(255, 255, 255, 0.16);
+    border-color: rgba(255, 255, 255, 0.35);
+    color: #ffffff;
+  }
+
+  .size-dot-preview {
+    background: #ffffff;
+    border-radius: 50%;
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.4);
+  }
+
+  .size-val-label {
+    font-size: 11px;
+    font-weight: 700;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .color-trigger-btn {
     display: flex;
     align-items: center;
     justify-content: center;
-    background: transparent;
-    border: 1px solid transparent;
-    border-radius: 5px;
+    width: 32px;
+    height: 32px;
+    background: rgba(255, 255, 255, 0.07);
+    border: 1px solid rgba(255, 255, 255, 0.15);
+    border-radius: 8px;
     cursor: pointer;
+    transition: all 0.15s ease;
     padding: 0;
   }
 
-  .size-chip:hover {
-    background: rgba(255, 255, 255, 0.08);
+  .color-trigger-btn:hover,
+  .color-trigger-btn.active {
+    background: rgba(255, 255, 255, 0.16);
+    border-color: rgba(255, 255, 255, 0.35);
   }
 
-  .size-chip.active {
-    border-color: rgba(255, 255, 255, 0.45);
-    background: rgba(255, 255, 255, 0.16);
+  .active-color-swatch {
+    width: 18px;
+    height: 18px;
+    border-radius: 50%;
+    border: 2px solid rgba(255, 255, 255, 0.9);
+    box-shadow: 0 2px 6px rgba(0, 0, 0, 0.35);
+  }
+
+  .popover-menu {
+    position: absolute;
+    top: calc(100% + 10px);
+    left: 50%;
+    transform: translateX(-50%);
+    background: rgba(22, 22, 28, 0.96);
+    backdrop-filter: blur(28px) saturate(190%);
+    -webkit-backdrop-filter: blur(28px) saturate(190%);
+    border: 1px solid rgba(255, 255, 255, 0.18);
+    border-radius: 14px;
+    padding: 12px 14px;
+    box-shadow: 0 16px 40px rgba(0, 0, 0, 0.65), 0 0 1px rgba(255, 255, 255, 0.2);
+    z-index: 100000;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    animation: popoverIn 0.14s cubic-bezier(0.16, 1, 0.3, 1);
+  }
+
+  @keyframes popoverIn {
+    from {
+      opacity: 0;
+      transform: translate(-50%, -6px) scale(0.96);
+    }
+    to {
+      opacity: 1;
+      transform: translate(-50%, 0) scale(1);
+    }
+  }
+
+  .size-popover {
+    width: 220px;
+  }
+
+  .color-popover {
+    width: 220px;
+  }
+
+  .popover-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }
+
+  .popover-title {
+    font-size: 11px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.6px;
+    color: rgba(255, 255, 255, 0.6);
+  }
+
+  .popover-badge {
+    font-size: 11px;
+    font-weight: 700;
+    color: #00c7be;
+    background: rgba(0, 199, 190, 0.15);
+    padding: 2px 7px;
+    border-radius: 6px;
+  }
+
+  .size-presets-grid {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 6px;
+  }
+
+  .size-preset-item {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    padding: 6px 4px;
+    background: rgba(255, 255, 255, 0.06);
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    border-radius: 8px;
+    color: #d1d1d6;
+    cursor: pointer;
+    transition: all 0.15s ease;
+  }
+
+  .size-preset-item:hover {
+    background: rgba(255, 255, 255, 0.12);
+    color: #ffffff;
+  }
+
+  .size-preset-item.active {
+    background: rgba(0, 122, 255, 0.25);
+    border-color: rgba(0, 122, 255, 0.6);
+    color: #ffffff;
   }
 
   .size-dot {
@@ -2357,31 +2719,133 @@
     border-radius: 50%;
   }
 
-  /* Color Palette */
-  .color-palette {
-    display: flex;
-    align-items: center;
-    gap: 4px;
+  .preset-label {
+    font-size: 10px;
+    font-weight: 600;
   }
 
-  .color-chip {
-    width: 17px;
-    height: 17px;
+  .slider-container {
+    padding: 4px 2px;
+  }
+
+  .stroke-range-slider {
+    width: 100%;
+    accent-color: #007aff;
+    cursor: pointer;
+    height: 4px;
+  }
+
+  .custom-color-btn {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    cursor: pointer;
+    padding: 2px 6px;
+    background: rgba(255, 255, 255, 0.08);
+    border: 1px solid rgba(255, 255, 255, 0.15);
+    border-radius: 6px;
+    transition: all 0.15s ease;
+  }
+
+  .custom-color-btn:hover {
+    background: rgba(255, 255, 255, 0.15);
+  }
+
+  .hidden-color-input {
+    opacity: 0;
+    width: 0;
+    height: 0;
+    position: absolute;
+    pointer-events: none;
+  }
+
+  .custom-swatch {
+    width: 12px;
+    height: 12px;
+    border-radius: 50%;
+    border: 1px solid rgba(255, 255, 255, 0.8);
+  }
+
+  .custom-text {
+    font-size: 10px;
+    font-weight: 600;
+    color: #ffffff;
+  }
+
+  .color-swatches-grid {
+    display: grid;
+    grid-template-columns: repeat(5, 1fr);
+    gap: 8px;
+    justify-items: center;
+  }
+
+  .color-chip-pop {
+    width: 26px;
+    height: 26px;
     border-radius: 50%;
     border: 2px solid transparent;
     cursor: pointer;
-    padding: 0;
-    transition: transform 0.15s, border-color 0.15s, box-shadow 0.15s;
+    transition: transform 0.15s ease, border-color 0.15s, box-shadow 0.15s;
+    box-shadow: 0 2px 6px rgba(0, 0, 0, 0.3);
   }
 
-  .color-chip:hover {
-    transform: scale(1.15);
+  .color-chip-pop:hover {
+    transform: scale(1.18);
   }
 
-  .color-chip.active {
+  .color-chip-pop.active {
     transform: scale(1.22);
     border-color: #ffffff;
-    box-shadow: 0 0 10px rgba(255, 255, 255, 0.7);
+    box-shadow: 0 0 12px rgba(255, 255, 255, 0.75);
+  }
+
+  /* Sleek Floating Tooltip */
+  .custom-tooltip {
+    position: fixed;
+    transform: translateX(-50%);
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 5px 10px;
+    background: rgba(18, 18, 24, 0.94);
+    backdrop-filter: blur(20px);
+    -webkit-backdrop-filter: blur(20px);
+    border: 1px solid rgba(255, 255, 255, 0.18);
+    border-radius: 8px;
+    box-shadow: 0 10px 30px rgba(0, 0, 0, 0.6);
+    color: #ffffff;
+    font-size: 11px;
+    font-weight: 500;
+    white-space: nowrap;
+    pointer-events: none;
+    z-index: 10000000;
+    animation: tooltipFade 0.12s cubic-bezier(0.16, 1, 0.3, 1);
+  }
+
+  .tooltip-title {
+    color: #f3f4f6;
+    font-weight: 600;
+  }
+
+  .tooltip-shortcut {
+    background: rgba(255, 255, 255, 0.14);
+    border: 1px solid rgba(255, 255, 255, 0.2);
+    border-radius: 4px;
+    padding: 1px 5px;
+    font-size: 10px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, monospace;
+    color: rgba(255, 255, 255, 0.9);
+  }
+
+  @keyframes tooltipFade {
+    from {
+      opacity: 0;
+      transform: translate(-50%, -4px);
+    }
+    to {
+      opacity: 1;
+      transform: translate(-50%, 0);
+    }
   }
 
   /* Icon Buttons */
