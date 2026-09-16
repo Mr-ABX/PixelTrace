@@ -1,0 +1,70 @@
+name: "Release PixelTrace"
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: "macos-latest"
+            args: "--target aarch64-apple-darwin"
+          - platform: "macos-13"
+            args: "--target x86_64-apple-darwin"
+          - platform: "windows-latest"
+            args: "--target x86_64-pc-windows-msvc"
+
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: "npm"
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.platform == 'macos-latest' && 'aarch64-apple-darwin' || matrix.platform == 'macos-13' && 'x86_64-apple-darwin' || 'x86_64-pc-windows-msvc' }}
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Build with Tauri Action
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: v__VERSION__
+          releaseName: "PixelTrace v__VERSION__"
+          releaseBody: |
+            ## PixelTrace v__VERSION__ Release 🚀
+
+            High-performance, fluid screen annotation & presentation tool built with Tauri v2 and Svelte 5.
+
+            ### ✨ Key Features:
+            - 🌟 **Continuous Spline Ribbon Laser Pointer**: Buttery-smooth glowing laser trails with dynamic bloom.
+            - 👻 **True Ghost Mode Passthrough**: Zero-latency click-through to background apps, windows, and multi-monitor setups.
+            - 📌 **Draggable Desktop Sticky Notes**: Persistent on-screen sticky notes with color themes and collapsible headers.
+            - 🎨 **Apple HIG Liquid Glass Toolbar**: Compact popovers for stroke sizing and curated color palette.
+            - ⚡ **Zero Idle CPU**: Smart event-driven rendering loop consuming ~45MB RAM.
+            - 🖥️ **Multi-Display Target Switching**: Target and draw across multiple monitors seamlessly.
+
+            ### 📦 Downloads:
+            - **macOS (Apple Silicon M-Series)**: `PixelTrace_*_aarch64.dmg`
+            - **macOS (Intel)**: `PixelTrace_*_x64.dmg`
+            - **Windows (x64)**: `PixelTrace_*_x64-setup.exe` or `.msi`
+          releaseDraft: false
+          prerelease: false
+          args: ${{ matrix.args }}
