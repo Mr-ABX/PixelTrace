@@ -25,6 +25,38 @@ use objc2_foundation::{NSPoint, NSRect};
 static ORIGINAL_HIT_TEST: AtomicUsize = AtomicUsize::new(0);
 
 #[cfg(target_os = "macos")]
+fn setup_macos_dock_icon() {
+    use objc2::msg_send;
+    use objc2::runtime::AnyClass;
+
+    const ICON_BYTES: &[u8] = include_bytes!("../icons/icon.png");
+
+    unsafe {
+        if let (Some(ns_data_cls), Some(ns_image_cls), Some(ns_app_cls)) = (
+            AnyClass::get(c"NSData"),
+            AnyClass::get(c"NSImage"),
+            AnyClass::get(c"NSApplication"),
+        ) {
+            let ns_data: *mut objc2::runtime::AnyObject = msg_send![
+                ns_data_cls,
+                dataWithBytes: ICON_BYTES.as_ptr() as *const std::ffi::c_void,
+                length: ICON_BYTES.len()
+            ];
+            if !ns_data.is_null() {
+                let ns_image: *mut objc2::runtime::AnyObject = msg_send![ns_image_cls, alloc];
+                let ns_image: *mut objc2::runtime::AnyObject = msg_send![ns_image, initWithData: ns_data];
+                if !ns_image.is_null() {
+                    let app: *mut objc2::runtime::AnyObject = msg_send![ns_app_cls, sharedApplication];
+                    if !app.is_null() {
+                        let _: () = msg_send![app, setApplicationIconImage: ns_image];
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
 unsafe extern "C" fn custom_hit_test(
     this: *mut objc2::runtime::AnyObject,
     cmd: objc2::runtime::Sel,
@@ -58,7 +90,7 @@ unsafe extern "C" fn custom_hit_test(
 
     let is_interactive = if let Ok(rects) = INTERACTIVE_RECTS.lock() {
         rects.iter().any(|r| {
-            x >= r.x && x <= (r.x + r.width) && y >= r.y && y <= (r.y + r.height)
+            x >= (r.x - 6.0) && x <= (r.x + r.width + 6.0) && y >= (r.y - 6.0) && y <= (r.y + r.height + 6.0)
         })
     } else {
         false
@@ -155,9 +187,12 @@ fn set_interactive_rects(rects: Vec<InteractiveRect>) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn set_window_interactive(window: WebviewWindow, interactive: bool) -> Result<(), String> {
-    let ignore = !interactive;
-    let _ = window.set_ignore_cursor_events(ignore);
+fn set_window_interactive(window: WebviewWindow, _interactive: bool) -> Result<(), String> {
+    #[cfg(not(target_os = "macos"))]
+    {
+        let ignore = !_interactive;
+        let _ = window.set_ignore_cursor_events(ignore);
+    }
 
     #[cfg(target_os = "macos")]
     {
@@ -166,7 +201,7 @@ fn set_window_interactive(window: WebviewWindow, interactive: bool) -> Result<()
         if let Ok(ns_win_ptr) = window.ns_window() {
             let ns_win = ns_win_ptr as *mut AnyObject;
             unsafe {
-                let _: () = msg_send![ns_win, setIgnoresMouseEvents: ignore];
+                let _: () = msg_send![ns_win, setIgnoresMouseEvents: false];
             }
         }
     }
@@ -176,6 +211,8 @@ fn set_window_interactive(window: WebviewWindow, interactive: bool) -> Result<()
 #[tauri::command]
 fn set_click_through(window: WebviewWindow, ignore: bool) -> Result<(), String> {
     IS_GHOST_MODE.store(ignore, Ordering::SeqCst);
+
+    #[cfg(not(target_os = "macos"))]
     let _ = window.set_ignore_cursor_events(ignore);
 
     #[cfg(target_os = "macos")]
@@ -185,7 +222,7 @@ fn set_click_through(window: WebviewWindow, ignore: bool) -> Result<(), String> 
         if let Ok(ns_win_ptr) = window.ns_window() {
             let ns_win = ns_win_ptr as *mut AnyObject;
             unsafe {
-                let _: () = msg_send![ns_win, setIgnoresMouseEvents: ignore];
+                let _: () = msg_send![ns_win, setIgnoresMouseEvents: false];
             }
         }
     }
@@ -298,7 +335,10 @@ pub fn run() {
             let _ = app.global_shortcut().register(shortcut_ghost_g);
 
             #[cfg(target_os = "macos")]
-            app.set_activation_policy(tauri::ActivationPolicy::Regular);
+            {
+                app.set_activation_policy(tauri::ActivationPolicy::Regular);
+                setup_macos_dock_icon();
+            }
 
             if let Some(window) = app.get_webview_window("main") {
                 // Determine primary monitor bounds to cover entire screen without native fullscreen mode
