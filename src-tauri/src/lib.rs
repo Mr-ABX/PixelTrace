@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use tauri::{
     menu::{Menu, MenuItem, PredefinedMenuItem},
@@ -22,10 +22,38 @@ static INTERACTIVE_RECTS: Mutex<Vec<InteractiveRect>> = Mutex::new(Vec::new());
 static CURRENTLY_IGNORING: AtomicBool = AtomicBool::new(false);
 
 #[cfg(target_os = "macos")]
-use objc2_foundation::{NSPoint, NSRect};
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+struct CGPoint {
+    x: f64,
+    y: f64,
+}
 
 #[cfg(target_os = "macos")]
-static ORIGINAL_HIT_TEST: AtomicUsize = AtomicUsize::new(0);
+type CGEventRef = *mut std::ffi::c_void;
+#[cfg(target_os = "macos")]
+type CGEventSourceRef = *mut std::ffi::c_void;
+
+#[cfg(target_os = "macos")]
+#[link(name = "CoreGraphics", kind = "framework")]
+extern "C" {
+    fn CGEventCreate(source: CGEventSourceRef) -> CGEventRef;
+    fn CGEventGetLocation(event: CGEventRef) -> CGPoint;
+    fn CFRelease(cf: *mut std::ffi::c_void);
+}
+
+#[cfg(target_os = "macos")]
+fn get_global_cursor_pos() -> Option<CGPoint> {
+    unsafe {
+        let event = CGEventCreate(std::ptr::null_mut());
+        if event.is_null() {
+            return None;
+        }
+        let pt = CGEventGetLocation(event);
+        CFRelease(event as *mut std::ffi::c_void);
+        Some(pt)
+    }
+}
 
 #[cfg(target_os = "macos")]
 fn setup_macos_dock_and_process() {
@@ -79,77 +107,50 @@ fn setup_macos_dock_and_process() {
 
 #[cfg(target_os = "macos")]
 fn start_macos_mouse_monitor(app_handle: AppHandle) {
-    use objc2::msg_send;
-    use objc2::runtime::{AnyClass, AnyObject};
-
     std::thread::spawn(move || {
         loop {
-            std::thread::sleep(std::time::Duration::from_millis(20));
+            std::thread::sleep(std::time::Duration::from_millis(25));
 
             let is_ghost = IS_GHOST_MODE.load(Ordering::Relaxed);
+            let win = match app_handle.get_webview_window("main") {
+                Some(w) => w,
+                None => continue,
+            };
+
             if !is_ghost {
                 if CURRENTLY_IGNORING.load(Ordering::Relaxed) {
                     CURRENTLY_IGNORING.store(false, Ordering::SeqCst);
-                    if let Some(win) = app_handle.get_webview_window("main") {
-                        if let Ok(ns_win_ptr) = win.ns_window() {
-                            let ns_win = ns_win_ptr as *mut AnyObject;
-                            unsafe {
-                                let _: () = msg_send![ns_win, setIgnoresMouseEvents: false];
-                            }
-                        }
-                    }
+                    let _ = win.set_ignore_cursor_events(false);
                 }
                 continue;
             }
 
-            // In Ghost Mode: Check cursor position globally across screen
-            let (mouse_loc, frame, ns_win) = match app_handle.get_webview_window("main") {
-                Some(win) => {
-                    if let Ok(ns_win_ptr) = win.ns_window() {
-                        let ns_win = ns_win_ptr as *mut AnyObject;
-                        unsafe {
-                            if let Some(ns_event_cls) = AnyClass::get(c"NSEvent") {
-                                let loc: NSPoint = msg_send![ns_event_cls, mouseLocation];
-                                let f: NSRect = msg_send![ns_win, frame];
-                                (loc, f, ns_win)
-                            } else {
-                                continue;
-                            }
-                        }
-                    } else {
-                        continue;
-                    }
-                }
+            // In Ghost Mode: query CoreGraphics global mouse location
+            let cursor = match get_global_cursor_pos() {
+                Some(pt) => pt,
                 None => continue,
             };
 
-            // Window bounds in Cocoa screen coordinates
-            let win_x = frame.origin.x;
-            let win_y = frame.origin.y;
-            let win_w = frame.size.width;
-            let win_h = frame.size.height;
+            let win_pos = match win.outer_position() {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+            let scale_factor = win.scale_factor().unwrap_or(1.0);
 
-            let inside_win = mouse_loc.x >= win_x
-                && mouse_loc.x <= (win_x + win_w)
-                && mouse_loc.y >= win_y
-                && mouse_loc.y <= (win_y + win_h);
+            // Convert physical screen coordinates to window-relative logical CSS pixels
+            let rel_x = cursor.x - (win_pos.x as f64 / scale_factor);
+            let rel_y = cursor.y - (win_pos.y as f64 / scale_factor);
 
             let mut inside_interactive = false;
-            if inside_win {
-                // Convert screen mouse location to webview CSS coordinates
-                let rel_x = mouse_loc.x - win_x;
-                let rel_y = win_h - (mouse_loc.y - win_y);
-
-                if let Ok(rects) = INTERACTIVE_RECTS.lock() {
-                    for r in rects.iter() {
-                        if rel_x >= (r.x - 10.0)
-                            && rel_x <= (r.x + r.width + 10.0)
-                            && rel_y >= (r.y - 10.0)
-                            && rel_y <= (r.y + r.height + 10.0)
-                        {
-                            inside_interactive = true;
-                            break;
-                        }
+            if let Ok(rects) = INTERACTIVE_RECTS.lock() {
+                for r in rects.iter() {
+                    if rel_x >= (r.x - 12.0)
+                        && rel_x <= (r.x + r.width + 12.0)
+                        && rel_y >= (r.y - 12.0)
+                        && rel_y <= (r.y + r.height + 12.0)
+                    {
+                        inside_interactive = true;
+                        break;
                     }
                 }
             }
@@ -159,59 +160,10 @@ fn start_macos_mouse_monitor(app_handle: AppHandle) {
 
             if should_ignore != was_ignoring {
                 CURRENTLY_IGNORING.store(should_ignore, Ordering::SeqCst);
-                unsafe {
-                    let _: () = msg_send![ns_win, setIgnoresMouseEvents: should_ignore];
-                }
+                let _ = win.set_ignore_cursor_events(should_ignore);
             }
         }
     });
-}
-
-#[cfg(target_os = "macos")]
-unsafe extern "C" fn custom_hit_test(
-    this: *mut objc2::runtime::AnyObject,
-    cmd: objc2::runtime::Sel,
-    point: NSPoint,
-) -> *mut objc2::runtime::AnyObject {
-    use objc2::msg_send;
-
-    let orig_ptr = ORIGINAL_HIT_TEST.load(Ordering::SeqCst);
-    if orig_ptr == 0 {
-        return std::ptr::null_mut();
-    }
-    let orig_fn: unsafe extern "C" fn(
-        *mut objc2::runtime::AnyObject,
-        objc2::runtime::Sel,
-        NSPoint,
-    ) -> *mut objc2::runtime::AnyObject = std::mem::transmute(orig_ptr);
-
-    let is_ghost = IS_GHOST_MODE.load(Ordering::SeqCst);
-    if !is_ghost {
-        return orig_fn(this, cmd, point);
-    }
-
-    let is_flipped: bool = msg_send![this, isFlipped];
-    let frame: NSRect = msg_send![this, frame];
-
-    let (x, y) = if is_flipped {
-        (point.x, point.y)
-    } else {
-        (point.x, frame.size.height - point.y)
-    };
-
-    let is_interactive = if let Ok(rects) = INTERACTIVE_RECTS.lock() {
-        rects.iter().any(|r| {
-            x >= (r.x - 6.0) && x <= (r.x + r.width + 6.0) && y >= (r.y - 6.0) && y <= (r.y + r.height + 6.0)
-        })
-    } else {
-        false
-    };
-
-    if is_interactive {
-        orig_fn(this, cmd, point)
-    } else {
-        std::ptr::null_mut()
-    }
 }
 
 #[derive(serde::Serialize)]
@@ -227,15 +179,7 @@ struct MonitorInfo {
 #[cfg(target_os = "macos")]
 fn setup_macos_window(window: &WebviewWindow) {
     use objc2::msg_send;
-    use objc2::runtime::{AnyClass, AnyObject, Sel};
-    use std::os::raw::c_void;
-
-    extern "C" {
-        fn class_getInstanceMethod(cls: *const AnyClass, name: Sel) -> *mut c_void;
-        fn method_getImplementation(m: *mut c_void) -> *mut c_void;
-        fn method_setImplementation(m: *mut c_void, imp: *mut c_void) -> *mut c_void;
-        fn object_getClass(obj: *mut AnyObject) -> *const AnyClass;
-    }
+    use objc2::runtime::{AnyClass, AnyObject};
 
     if let Ok(ns_win_ptr) = window.ns_window() {
         let ns_win = ns_win_ptr as *mut AnyObject;
@@ -256,7 +200,6 @@ fn setup_macos_window(window: &WebviewWindow) {
             let _: () = msg_send![ns_win, setOpaque: false];
             let _: () = msg_send![ns_win, setAcceptsMouseMovedEvents: true];
             let _: () = msg_send![ns_win, setTitlebarAppearsTransparent: true];
-            let _: () = msg_send![ns_win, setIgnoresMouseEvents: false];
 
             // Hide standard traffic-light buttons so window controls never drop down
             for button_id in 0..3isize {
@@ -269,21 +212,6 @@ fn setup_macos_window(window: &WebviewWindow) {
             if let Some(ns_color_cls) = AnyClass::get(c"NSColor") {
                 let clear_color: *mut AnyObject = msg_send![ns_color_cls, clearColor];
                 let _: () = msg_send![ns_win, setBackgroundColor: clear_color];
-            }
-
-            // Swizzle hitTest: on contentView to allow selective click-through
-            let content_view: *mut AnyObject = msg_send![ns_win, contentView];
-            if !content_view.is_null() {
-                let cls = object_getClass(content_view);
-                if !cls.is_null() {
-                    let sel = Sel::register(c"hitTest:");
-                    let method = class_getInstanceMethod(cls, sel);
-                    if !method.is_null() && ORIGINAL_HIT_TEST.load(Ordering::SeqCst) == 0 {
-                        let original_imp = method_getImplementation(method);
-                        ORIGINAL_HIT_TEST.store(original_imp as usize, Ordering::SeqCst);
-                        method_setImplementation(method, custom_hit_test as *mut c_void);
-                    }
-                }
             }
         }
     }
@@ -299,31 +227,16 @@ fn set_interactive_rects(rects: Vec<InteractiveRect>) -> Result<(), String> {
 
 #[tauri::command]
 fn set_window_interactive(window: WebviewWindow, interactive: bool) -> Result<(), String> {
-    #[cfg(not(target_os = "macos"))]
-    {
-        let ignore = !interactive;
-        let _ = window.set_ignore_cursor_events(ignore);
-    }
+    let ignore = if interactive {
+        false
+    } else {
+        IS_GHOST_MODE.load(Ordering::Relaxed)
+    };
 
     #[cfg(target_os = "macos")]
-    {
-        use objc2::msg_send;
-        use objc2::runtime::AnyObject;
+    CURRENTLY_IGNORING.store(ignore, Ordering::SeqCst);
 
-        let ignore = if interactive {
-            false
-        } else {
-            IS_GHOST_MODE.load(Ordering::Relaxed)
-        };
-
-        CURRENTLY_IGNORING.store(ignore, Ordering::SeqCst);
-        if let Ok(ns_win_ptr) = window.ns_window() {
-            let ns_win = ns_win_ptr as *mut AnyObject;
-            unsafe {
-                let _: () = msg_send![ns_win, setIgnoresMouseEvents: ignore];
-            }
-        }
-    }
+    let _ = window.set_ignore_cursor_events(ignore);
     Ok(())
 }
 
@@ -331,22 +244,10 @@ fn set_window_interactive(window: WebviewWindow, interactive: bool) -> Result<()
 fn set_click_through(window: WebviewWindow, ignore: bool) -> Result<(), String> {
     IS_GHOST_MODE.store(ignore, Ordering::SeqCst);
 
-    #[cfg(not(target_os = "macos"))]
-    let _ = window.set_ignore_cursor_events(ignore);
-
     #[cfg(target_os = "macos")]
-    {
-        use objc2::msg_send;
-        use objc2::runtime::AnyObject;
+    CURRENTLY_IGNORING.store(ignore, Ordering::SeqCst);
 
-        CURRENTLY_IGNORING.store(ignore, Ordering::SeqCst);
-        if let Ok(ns_win_ptr) = window.ns_window() {
-            let ns_win = ns_win_ptr as *mut AnyObject;
-            unsafe {
-                let _: () = msg_send![ns_win, setIgnoresMouseEvents: ignore];
-            }
-        }
-    }
+    let _ = window.set_ignore_cursor_events(ignore);
 
     if !ignore {
         let _ = window.set_focus();
