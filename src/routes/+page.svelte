@@ -236,17 +236,24 @@
     };
   });
 
-  function centerToolbar() {
-    tick().then(() => {
-      const width = toolbarRef ? toolbarRef.offsetWidth : 940;
-      widgetX = Math.max(16, Math.round((window.innerWidth - width) / 2));
-      widgetY = 20;
-    });
+  async function centerToolbar() {
+    await tick();
+    const w = window.innerWidth;
+    const bar = toolbarRef?.querySelector(".glass-bar") as HTMLElement | null;
+    const width = bar ? bar.offsetWidth : (toolbarRef ? toolbarRef.offsetWidth : 940);
+    widgetX = Math.max(16, Math.min(w - width - 16, Math.round((w - width) / 2)));
+    widgetY = 24;
+    updateInteractiveRects();
   }
 
   function handleResize() {
     initCanvases();
-    centerToolbar();
+    if (!isCollapsed) {
+      centerToolbar();
+    } else {
+      widgetX = 0;
+      updateInteractiveRects();
+    }
   }
 
   function initCanvases() {
@@ -1118,15 +1125,17 @@
     tick().then(updateInteractiveRects);
   }
 
-  function expandFromEdge() {
+  async function expandFromEdge() {
     isCollapsed = false;
+    await tick();
     const w = window.innerWidth;
-    const barWidth = toolbarRef ? toolbarRef.offsetWidth : 940;
+    const bar = toolbarRef?.querySelector(".glass-bar") as HTMLElement | null;
+    const barWidth = bar ? bar.offsetWidth : (toolbarRef ? toolbarRef.offsetWidth : 940);
 
     // Pull out straight from left wall directly into exact top-center of the screen
     widgetX = Math.max(16, Math.min(w - barWidth - 16, Math.round((w - barWidth) / 2)));
-    widgetY = 20;
-    tick().then(updateInteractiveRects);
+    widgetY = 24;
+    updateInteractiveRects();
   }
 
   function onMouseEnterInteractive() {
@@ -1318,11 +1327,12 @@
 
     const w = window.innerWidth;
     const h = window.innerHeight;
-    const barWidth = toolbarRef ? toolbarRef.offsetWidth : 940;
-    const barHeight = toolbarRef ? toolbarRef.offsetHeight : 54;
+    const bar = toolbarRef?.querySelector(".glass-bar") as HTMLElement | null;
+    const barWidth = bar ? bar.offsetWidth : (toolbarRef ? toolbarRef.offsetWidth : 940);
+    const barHeight = bar ? bar.offsetHeight : (toolbarRef ? toolbarRef.offsetHeight : 54);
 
-    widgetX = Math.max(12, Math.min(w - barWidth - 12, widgetX));
-    widgetY = Math.max(12, Math.min(h - barHeight - 12, widgetY));
+    widgetX = Math.max(16, Math.min(w - barWidth - 16, widgetX));
+    widgetY = Math.max(16, Math.min(h - barHeight - 16, widgetY));
 
     isDocked = widgetY <= 16;
     updateInteractiveRects();
