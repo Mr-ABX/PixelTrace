@@ -14,6 +14,10 @@ edition = "2021"
 name = "pixeltrace_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
+[[bin]]
+name = "PixelTrace"
+path = "src/main.rs"
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 

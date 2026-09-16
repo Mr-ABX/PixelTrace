@@ -21,6 +21,9 @@
     Trash2,
     Ghost,
     Keyboard,
+    Settings,
+    Sliders,
+    Check,
     GripVertical,
     Monitor,
     ChevronLeft,
@@ -130,8 +133,9 @@
   // Eraser State
   let eraserCursor = $state({ x: -100, y: -100, visible: false });
 
-  // Settings / Help modal
+  // Settings / Help modal & Preferences
   let showHelpModal = $state(false);
+  let modalActiveTab = $state<"shortcuts" | "preferences" | "about">("shortcuts");
 
   // Canvas references
   let staticCanvas: HTMLCanvasElement;
@@ -148,7 +152,7 @@
   let laserPoints: LaserPoint[] = [];
   let laserAnimFrame: number | null = null;
   let laserCursor = $state({ x: -100, y: -100, visible: false, isPressed: false });
-  const LASER_LIFETIME_MS = 850;
+  let laserLifetimeMs = $state(850);
 
   // Floating Widget positioning, snapping & edge docking
   let toolbarRef = $state<HTMLDivElement | null>(null);
@@ -204,12 +208,23 @@
       if (savedNotes) {
         stickyNotes = JSON.parse(savedNotes);
       }
+      const savedTool = localStorage.getItem("pixeltrace_pref_tool");
+      if (savedTool) currentTool = savedTool as Tool;
+      const savedSize = localStorage.getItem("pixeltrace_pref_size");
+      if (savedSize) currentSize = Number(savedSize);
+      const savedColor = localStorage.getItem("pixeltrace_pref_color");
+      if (savedColor) currentColor = savedColor;
+      const savedFade = localStorage.getItem("pixeltrace_pref_autofade");
+      if (savedFade !== null) autoFadeEnabled = savedFade === "true";
+      const savedLaserDur = localStorage.getItem("pixeltrace_pref_laser_duration");
+      if (savedLaserDur) laserLifetimeMs = Number(savedLaserDur);
     } catch (e) {
-      console.warn("Could not load sticky notes:", e);
+      console.warn("Could not load stored preferences:", e);
     }
 
     let unlistenGhost: UnlistenFn | undefined;
     let unlistenClear: UnlistenFn | undefined;
+    let unlistenPrefs: UnlistenFn | undefined;
 
     (async () => {
       try {
@@ -230,6 +245,10 @@
         unlistenClear = await listen("clear-canvas", () => {
           clearCanvas();
         });
+
+        unlistenPrefs = await listen("open-preferences", () => {
+          openPreferencesModal("preferences");
+        });
       } catch (e) {
         console.warn("Could not attach event listeners:", e);
       }
@@ -242,6 +261,7 @@
       if (laserAnimFrame) cancelAnimationFrame(laserAnimFrame);
       if (unlistenGhost) unlistenGhost();
       if (unlistenClear) unlistenClear();
+      if (unlistenPrefs) unlistenPrefs();
     };
   });
 
@@ -295,12 +315,20 @@
     }, 3200);
   }
 
+  function triggerToast(msg: string) {
+    if (ghostNotifyTimer) clearTimeout(ghostNotifyTimer);
+    ghostNotification = msg;
+    ghostNotifyTimer = window.setTimeout(() => {
+      ghostNotification = null;
+    }, 3200);
+  }
+
   // --- CONTINUOUS GLOWING LASER POINTER ENGINE (BUTTERY SMOOTH SPLINE RIBBON) ---
   function renderLaserLoop(now: number) {
     if (!dynamicCtx) return;
 
     // Prune expired laser points
-    laserPoints = laserPoints.filter((p) => now - p.time < LASER_LIFETIME_MS);
+    laserPoints = laserPoints.filter((p) => now - p.time < laserLifetimeMs);
 
     // Only clear dynamicCtx if we are using the laser or if trail points remain
     if (currentTool === "laser" || laserPoints.length > 0) {
@@ -322,7 +350,7 @@
       for (let i = 0; i < n; i++) {
         const p = laserPoints[i];
         const age = now - p.time;
-        const progress = Math.max(0, Math.min(1, 1 - age / LASER_LIFETIME_MS));
+        const progress = Math.max(0, Math.min(1, 1 - age / laserLifetimeMs));
         const outerRadius = Math.max(1, (currentSize * 2.8 + 4) * Math.pow(progress, 1.15));
         const coreRadius = Math.max(0.5, (currentSize * 1.2 + 2) * Math.pow(progress, 1.1));
 
@@ -1168,13 +1196,15 @@
       });
     }
 
-    // Shortcuts modal
+    // Preferences & Shortcuts modal
     if (showHelpModal) {
+      const mw = 490;
+      const mh = 480;
       rects.push({
-        x: Math.max(0, (window.innerWidth - 420) / 2),
-        y: Math.max(0, (window.innerHeight - 400) / 2),
-        width: 420,
-        height: 400
+        x: Math.max(0, (window.innerWidth - mw) / 2),
+        y: Math.max(0, (window.innerHeight - mh) / 2),
+        width: mw,
+        height: mh
       });
     }
 
@@ -1189,6 +1219,12 @@
     }
 
     invoke("set_interactive_rects", { rects }).catch(() => {});
+  }
+
+  function openPreferencesModal(tab: "shortcuts" | "preferences" | "about" = "shortcuts") {
+    modalActiveTab = tab;
+    showHelpModal = true;
+    tick().then(updateInteractiveRects);
   }
 
   function collapseToNearestEdge() {
@@ -1338,6 +1374,18 @@
     if ((e.metaKey || e.ctrlKey) && key === "y") {
       e.preventDefault();
       redo();
+      return;
+    }
+
+    if ((e.metaKey || e.ctrlKey) && key === ",") {
+      e.preventDefault();
+      openPreferencesModal("preferences");
+      return;
+    }
+
+    if (e.key === "?" || (e.metaKey && e.shiftKey && key === "/")) {
+      e.preventDefault();
+      openPreferencesModal("shortcuts");
       return;
     }
 
@@ -1950,13 +1998,21 @@
         </div>
       </button>
 
+      <!-- Preferences / Settings Button -->
+      <button
+        class="icon-btn"
+        onclick={() => openPreferencesModal("preferences")}
+        onmouseenter={(e) => showTooltip(e, "Preferences & Settings", "⌘,")}
+        onmouseleave={hideTooltip}
+        aria-label="Preferences & Settings"
+      >
+        <Settings size={16} />
+      </button>
+
       <!-- Keyboard Shortcuts / Help Button -->
       <button
         class="icon-btn"
-        onclick={() => {
-          showHelpModal = !showHelpModal;
-          tick().then(updateInteractiveRects);
-        }}
+        onclick={() => openPreferencesModal("shortcuts")}
         onmouseenter={(e) => showTooltip(e, "Shortcuts & About", "?")}
         onmouseleave={hideTooltip}
         aria-label="Keyboard Shortcuts & About"
@@ -1991,7 +2047,7 @@
   </div>
 {/if}
 
-<!-- Shortcuts Modal -->
+<!-- Shortcuts & Preferences Modal -->
 {#if showHelpModal}
   <div
     class="modal-backdrop"
@@ -2001,10 +2057,16 @@
     onmouseenter={onMouseEnterInteractive}
     onmouseleave={onMouseLeaveInteractive}
     onclick={(e) => {
-      if (e.target === e.currentTarget) showHelpModal = false;
+      if (e.target === e.currentTarget) {
+        showHelpModal = false;
+        tick().then(updateInteractiveRects);
+      }
     }}
     onkeydown={(e) => {
-      if (e.key === "Escape") showHelpModal = false;
+      if (e.key === "Escape") {
+        showHelpModal = false;
+        tick().then(updateInteractiveRects);
+      }
     }}
   >
     <div
@@ -2012,68 +2074,225 @@
       role="document"
     >
       <div class="modal-header">
-        <div class="modal-title">
-          <img src="/app-logo.png" alt="PixelTrace" class="modal-brand-logo" />
-          <h3>PixelTrace Shortcuts</h3>
+        <div class="modal-tabs">
+          <button
+            class="tab-btn"
+            class:active={modalActiveTab === "shortcuts"}
+            onclick={() => { modalActiveTab = "shortcuts"; tick().then(updateInteractiveRects); }}
+          >
+            <Keyboard size={13} />
+            <span>Shortcuts</span>
+          </button>
+          <button
+            class="tab-btn"
+            class:active={modalActiveTab === "preferences"}
+            onclick={() => { modalActiveTab = "preferences"; tick().then(updateInteractiveRects); }}
+          >
+            <Sliders size={13} />
+            <span>Preferences</span>
+          </button>
+          <button
+            class="tab-btn"
+            class:active={modalActiveTab === "about"}
+            onclick={() => { modalActiveTab = "about"; tick().then(updateInteractiveRects); }}
+          >
+            <span>About</span>
+          </button>
         </div>
         <button
           class="modal-close"
-          onclick={() => (showHelpModal = false)}
+          onclick={() => {
+            showHelpModal = false;
+            tick().then(updateInteractiveRects);
+          }}
           aria-label="Close dialog"
         >
-          <X size={16} />
+          <X size={15} />
         </button>
       </div>
 
       <div class="modal-body">
-        <div class="shortcut-row">
-          <span>Toggle Overlay Visibility (Hide/Show)</span>
-          <kbd>⌘ + Shift + D</kbd>
-        </div>
-        <div class="shortcut-row">
-          <span>Toggle Ghost Mode (Global Passthrough)</span>
-          <kbd>⌘ + Shift + X / ⌘⇧G</kbd>
-        </div>
-        <div class="shortcut-row">
-          <span>Ghost Mode Quick Toggle (when focused)</span>
-          <kbd>X / G</kbd>
-        </div>
-        <div class="shortcut-row">
-          <span>Laser Pointer (Continuous Trail)</span>
-          <kbd>L / 1</kbd>
-        </div>
-        <div class="shortcut-row">
-          <span>Smooth Pen / Highlighter</span>
-          <kbd>P / H</kbd>
-        </div>
-        <div class="shortcut-row">
-          <span>Arrow / Rect / Circle / Line</span>
-          <kbd>A / R / C / I</kbd>
-        </div>
-        <div class="shortcut-row">
-          <span>Numbered Stamp / Text Note</span>
-          <kbd>S / T</kbd>
-        </div>
-        <div class="shortcut-row">
-          <span>Eraser Tool (Vector Erase)</span>
-          <kbd>E / 0</kbd>
-        </div>
-        <div class="shortcut-row">
-          <span>Sticky Note (Physical Note)</span>
-          <kbd>N</kbd>
-        </div>
-        <div class="shortcut-row">
-          <span>Collapse / Expand Toolbar</span>
-          <kbd>Space</kbd>
-        </div>
-        <div class="shortcut-row">
-          <span>Undo / Redo</span>
-          <kbd>⌘Z / ⌘⇧Z</kbd>
-        </div>
-        <div class="shortcut-row">
-          <span>Clear All Screen Markups</span>
-          <kbd>Esc</kbd>
-        </div>
+        {#if modalActiveTab === "shortcuts"}
+          <div class="shortcuts-scrollable">
+            <div class="shortcut-group">
+              <span class="group-title">Navigation & Modes</span>
+              <div class="shortcut-row">
+                <span>Toggle Overlay (Hide / Show)</span>
+                <kbd>⌘ + Shift + D</kbd>
+              </div>
+              <div class="shortcut-row">
+                <span>Toggle Ghost Mode (Click-Through)</span>
+                <kbd>⌘ + Shift + X / ⌘⇧G</kbd>
+              </div>
+              <div class="shortcut-row">
+                <span>Ghost Quick Toggle (when focused)</span>
+                <kbd>X / G</kbd>
+              </div>
+              <div class="shortcut-row">
+                <span>Collapse / Expand Toolbar</span>
+                <kbd>Space</kbd>
+              </div>
+              <div class="shortcut-row">
+                <span>Open Preferences & Settings</span>
+                <kbd>⌘ + ,</kbd>
+              </div>
+            </div>
+
+            <div class="shortcut-group">
+              <span class="group-title">Drawing & Annotation Tools</span>
+              <div class="shortcut-row">
+                <span>Laser Pointer (Continuous Glow)</span>
+                <kbd>1 / L</kbd>
+              </div>
+              <div class="shortcut-row">
+                <span>Pen / Marker</span>
+                <kbd>2 / P</kbd>
+              </div>
+              <div class="shortcut-row">
+                <span>Translucent Highlighter</span>
+                <kbd>3 / H</kbd>
+              </div>
+              <div class="shortcut-row">
+                <span>Arrow Tool</span>
+                <kbd>4 / A</kbd>
+              </div>
+              <div class="shortcut-row">
+                <span>Rectangle & Circle Shapes</span>
+                <kbd>5 / 6 / R / C</kbd>
+              </div>
+              <div class="shortcut-row">
+                <span>Straight Line</span>
+                <kbd>7 / I</kbd>
+              </div>
+              <div class="shortcut-row">
+                <span>Numbered Step Stamp</span>
+                <kbd>8 / S</kbd>
+              </div>
+              <div class="shortcut-row">
+                <span>Screen Text Note</span>
+                <kbd>9 / T</kbd>
+              </div>
+              <div class="shortcut-row">
+                <span>Vector Eraser</span>
+                <kbd>0 / E</kbd>
+              </div>
+              <div class="shortcut-row">
+                <span>Desktop Sticky Note</span>
+                <kbd>N</kbd>
+              </div>
+            </div>
+
+            <div class="shortcut-group">
+              <span class="group-title">Canvas Management</span>
+              <div class="shortcut-row">
+                <span>Undo Last Action</span>
+                <kbd>⌘ + Z</kbd>
+              </div>
+              <div class="shortcut-row">
+                <span>Redo Action</span>
+                <kbd>⌘ + Shift + Z / ⌘ + Y</kbd>
+              </div>
+              <div class="shortcut-row">
+                <span>Clear Screen Markups</span>
+                <kbd>Esc</kbd>
+              </div>
+            </div>
+          </div>
+        {:else if modalActiveTab === "preferences"}
+          <div class="preferences-pane">
+            <div class="pref-card">
+              <div class="pref-info">
+                <span class="pref-label">Auto-Fade Annotations</span>
+                <span class="pref-sub">Automatically clear drawn strokes after 3.5 seconds</span>
+              </div>
+              <label class="switch">
+                <input
+                  type="checkbox"
+                  checked={autoFadeEnabled}
+                  onchange={(e) => {
+                    autoFadeEnabled = e.currentTarget.checked;
+                    try { localStorage.setItem("pixeltrace_pref_autofade", String(autoFadeEnabled)); } catch {}
+                    triggerToast(autoFadeEnabled ? "Auto-Fade Enabled (3.5s)" : "Auto-Fade Disabled");
+                  }}
+                />
+                <span class="slider"></span>
+              </label>
+            </div>
+
+            <div class="pref-card">
+              <div class="pref-info">
+                <span class="pref-label">Default Tool on Launch</span>
+                <span class="pref-sub">Initial active annotation tool when opening the app</span>
+              </div>
+              <select
+                class="pref-select"
+                value={currentTool}
+                onchange={(e) => {
+                  currentTool = e.currentTarget.value as Tool;
+                  try { localStorage.setItem("pixeltrace_pref_tool", currentTool); } catch {}
+                }}
+              >
+                <option value="laser">Laser Pointer</option>
+                <option value="pen">Pen Marker</option>
+                <option value="highlighter">Highlighter</option>
+                <option value="arrow">Arrow</option>
+                <option value="rect">Rectangle</option>
+                <option value="circle">Circle</option>
+                <option value="stamp">Stamp</option>
+                <option value="sticky">Sticky Note</option>
+              </select>
+            </div>
+
+            <div class="pref-card">
+              <div class="pref-info">
+                <span class="pref-label">Default Stroke Thickness</span>
+                <span class="pref-sub">Default line width for drawing tools</span>
+              </div>
+              <select
+                class="pref-select"
+                value={currentSize}
+                onchange={(e) => {
+                  currentSize = Number(e.currentTarget.value);
+                  try { localStorage.setItem("pixeltrace_pref_size", String(currentSize)); } catch {}
+                }}
+              >
+                <option value="2">Fine (2px)</option>
+                <option value="4">Medium (4px)</option>
+                <option value="8">Thick (8px)</option>
+                <option value="14">Heavy (14px)</option>
+              </select>
+            </div>
+
+            <div class="pref-card">
+              <div class="pref-info">
+                <span class="pref-label">Laser Beam Persistence</span>
+                <span class="pref-sub">Smooth glowing trail decay duration</span>
+              </div>
+              <select
+                class="pref-select"
+                value={laserLifetimeMs}
+                onchange={(e) => {
+                  laserLifetimeMs = Number(e.currentTarget.value);
+                  try { localStorage.setItem("pixeltrace_pref_laser_duration", String(laserLifetimeMs)); } catch {}
+                }}
+              >
+                <option value="500">Snappy (500ms)</option>
+                <option value="850">Balanced (850ms)</option>
+                <option value="1300">Cinematic Trail (1.3s)</option>
+              </select>
+            </div>
+          </div>
+        {:else}
+          <div class="about-pane">
+            <img src="/app-logo.png" alt="PixelTrace" class="about-logo" />
+            <h3 class="about-name">PixelTrace</h3>
+            <span class="about-tagline">macOS Native Screen Annotator</span>
+            <span class="about-ver">Version 0.1.0 • Built with Tauri & Svelte</span>
+            <p class="about-desc">
+              PixelTrace brings instant, fluid on-screen markup, continuous spline laser trails, persistent desktop sticky notes, multi-display targeting, and zero-latency ghost passthrough to macOS.
+            </p>
+          </div>
+        {/if}
       </div>
     </div>
   </div>
@@ -2973,73 +3192,281 @@
   }
 
   .modal-card {
-    background: rgba(24, 24, 30, 0.96);
-    border: 1px solid rgba(255, 255, 255, 0.16);
-    border-radius: 16px;
-    width: 390px;
-    padding: 18px 22px;
-    box-shadow: 0 20px 50px rgba(0, 0, 0, 0.65);
+    background: rgba(20, 20, 28, 0.96);
+    border: 1px solid rgba(255, 255, 255, 0.18);
+    border-radius: 18px;
+    width: 480px;
+    max-height: 520px;
+    padding: 16px 20px;
+    box-shadow: 0 24px 60px rgba(0, 0, 0, 0.75);
     color: #ffffff;
+    display: flex;
+    flex-direction: column;
   }
 
   .modal-header {
     display: flex;
     align-items: center;
     justify-content: space-between;
-    margin-bottom: 16px;
+    margin-bottom: 14px;
+    padding-bottom: 10px;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.08);
   }
 
-  .modal-title {
+  .modal-tabs {
     display: flex;
     align-items: center;
-    gap: 8px;
+    gap: 4px;
+    background: rgba(255, 255, 255, 0.06);
+    padding: 3px;
+    border-radius: 10px;
+    border: 1px solid rgba(255, 255, 255, 0.08);
   }
 
-  .modal-title h3 {
-    margin: 0;
-    font-size: 16px;
-    font-weight: 700;
+  .tab-btn {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 10px;
+    font-size: 12px;
+    font-weight: 500;
+    color: rgba(255, 255, 255, 0.65);
+    background: transparent;
+    border: none;
+    border-radius: 7px;
+    cursor: pointer;
+    transition: all 0.15s;
+  }
+
+  .tab-btn:hover {
+    color: #ffffff;
+  }
+
+  .tab-btn.active {
+    background: rgba(255, 255, 255, 0.15);
+    color: #ffffff;
+    box-shadow: 0 2px 6px rgba(0, 0, 0, 0.3);
   }
 
   .modal-close {
     background: transparent;
     border: none;
-    color: rgba(255, 255, 255, 0.6);
+    color: rgba(255, 255, 255, 0.55);
     cursor: pointer;
-    padding: 4px;
+    padding: 5px;
     display: flex;
     align-items: center;
     justify-content: center;
     border-radius: 6px;
-    transition: color 0.15s;
+    transition: color 0.15s, background 0.15s;
   }
 
   .modal-close:hover {
     color: #ffffff;
-    background: rgba(255, 255, 255, 0.08);
+    background: rgba(255, 255, 255, 0.1);
   }
 
   .modal-body {
+    flex: 1;
+    overflow-y: auto;
     display: flex;
     flex-direction: column;
-    gap: 10px;
+    gap: 12px;
+    padding-right: 4px;
+  }
+
+  .modal-body::-webkit-scrollbar {
+    width: 5px;
+  }
+
+  .modal-body::-webkit-scrollbar-thumb {
+    background: rgba(255, 255, 255, 0.15);
+    border-radius: 10px;
+  }
+
+  /* Shortcuts Pane */
+  .shortcuts-scrollable {
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+  }
+
+  .shortcut-group {
+    display: flex;
+    flex-direction: column;
+    gap: 7px;
+  }
+
+  .group-title {
+    font-size: 11px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: #00c7be;
+    margin-bottom: 2px;
   }
 
   .shortcut-row {
     display: flex;
     align-items: center;
     justify-content: space-between;
-    font-size: 13px;
+    font-size: 12px;
     color: #d1d1d6;
+    padding: 2px 0;
   }
 
   kbd {
     background: rgba(255, 255, 255, 0.12);
     border: 1px solid rgba(255, 255, 255, 0.2);
     border-radius: 5px;
-    padding: 3px 8px;
+    padding: 2px 7px;
     font-size: 11px;
     font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
     color: #ffffff;
+  }
+
+  /* Preferences Pane */
+  .preferences-pane {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }
+
+  .pref-card {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 10px 14px;
+    background: rgba(255, 255, 255, 0.04);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: 11px;
+    gap: 12px;
+  }
+
+  .pref-info {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+
+  .pref-label {
+    font-size: 13px;
+    font-weight: 600;
+    color: #f3f4f6;
+  }
+
+  .pref-sub {
+    font-size: 11px;
+    color: rgba(255, 255, 255, 0.55);
+  }
+
+  .pref-select {
+    background: rgba(255, 255, 255, 0.1);
+    border: 1px solid rgba(255, 255, 255, 0.2);
+    border-radius: 8px;
+    color: #ffffff;
+    font-size: 12px;
+    font-weight: 500;
+    padding: 5px 10px;
+    outline: none;
+    cursor: pointer;
+  }
+
+  .pref-select option {
+    background: #1c1c24;
+    color: #ffffff;
+  }
+
+  /* Apple Switch */
+  .switch {
+    position: relative;
+    display: inline-block;
+    width: 38px;
+    height: 22px;
+    flex-shrink: 0;
+  }
+
+  .switch input {
+    opacity: 0;
+    width: 0;
+    height: 0;
+  }
+
+  .slider {
+    position: absolute;
+    cursor: pointer;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    background-color: rgba(255, 255, 255, 0.16);
+    transition: 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+    border-radius: 34px;
+    border: 1px solid rgba(255, 255, 255, 0.2);
+  }
+
+  .slider:before {
+    position: absolute;
+    content: "";
+    height: 16px;
+    width: 16px;
+    left: 2px;
+    bottom: 2px;
+    background-color: white;
+    transition: 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+    border-radius: 50%;
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.4);
+  }
+
+  input:checked + .slider {
+    background-color: #34c759;
+    border-color: #34c759;
+  }
+
+  input:checked + .slider:before {
+    transform: translateX(16px);
+  }
+
+  /* About Pane */
+  .about-pane {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    text-align: center;
+    padding: 16px 12px;
+    gap: 8px;
+  }
+
+  .about-logo {
+    width: 64px;
+    height: 64px;
+    border-radius: 14px;
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+  }
+
+  .about-name {
+    margin: 4px 0 0 0;
+    font-size: 18px;
+    font-weight: 700;
+    letter-spacing: -0.01em;
+  }
+
+  .about-tagline {
+    font-size: 12px;
+    color: #00c7be;
+    font-weight: 600;
+  }
+
+  .about-ver {
+    font-size: 11px;
+    color: rgba(255, 255, 255, 0.45);
+  }
+
+  .about-desc {
+    margin: 8px 0 0 0;
+    font-size: 12px;
+    line-height: 1.5;
+    color: rgba(255, 255, 255, 0.7);
+    max-width: 360px;
   }
 </style>

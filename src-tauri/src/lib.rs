@@ -19,19 +19,40 @@ static IS_GHOST_MODE: AtomicBool = AtomicBool::new(false);
 static INTERACTIVE_RECTS: Mutex<Vec<InteractiveRect>> = Mutex::new(Vec::new());
 
 #[cfg(target_os = "macos")]
+static CURRENTLY_IGNORING: AtomicBool = AtomicBool::new(false);
+
+#[cfg(target_os = "macos")]
 use objc2_foundation::{NSPoint, NSRect};
 
 #[cfg(target_os = "macos")]
 static ORIGINAL_HIT_TEST: AtomicUsize = AtomicUsize::new(0);
 
 #[cfg(target_os = "macos")]
-fn setup_macos_dock_icon() {
+fn setup_macos_dock_and_process() {
     use objc2::msg_send;
     use objc2::runtime::AnyClass;
 
     const ICON_BYTES: &[u8] = include_bytes!("../icons/icon.png");
 
     unsafe {
+        // Explicitly set process name to "PixelTrace"
+        if let (Some(ns_process_info_cls), Some(ns_string_cls)) = (
+            AnyClass::get(c"NSProcessInfo"),
+            AnyClass::get(c"NSString"),
+        ) {
+            let process_info: *mut objc2::runtime::AnyObject = msg_send![ns_process_info_cls, processInfo];
+            if !process_info.is_null() {
+                let name_str: *mut objc2::runtime::AnyObject = msg_send![
+                    ns_string_cls,
+                    stringWithUTF8String: b"PixelTrace\0".as_ptr() as *const std::ffi::c_char
+                ];
+                if !name_str.is_null() {
+                    let _: () = msg_send![process_info, setProcessName: name_str];
+                }
+            }
+        }
+
+        // Set Dock Icon image to Apple HIG centered squircle icon
         if let (Some(ns_data_cls), Some(ns_image_cls), Some(ns_app_cls)) = (
             AnyClass::get(c"NSData"),
             AnyClass::get(c"NSImage"),
@@ -54,6 +75,96 @@ fn setup_macos_dock_icon() {
             }
         }
     }
+}
+
+#[cfg(target_os = "macos")]
+fn start_macos_mouse_monitor(app_handle: AppHandle) {
+    use objc2::msg_send;
+    use objc2::runtime::{AnyClass, AnyObject};
+
+    std::thread::spawn(move || {
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+
+            let is_ghost = IS_GHOST_MODE.load(Ordering::Relaxed);
+            if !is_ghost {
+                if CURRENTLY_IGNORING.load(Ordering::Relaxed) {
+                    CURRENTLY_IGNORING.store(false, Ordering::SeqCst);
+                    if let Some(win) = app_handle.get_webview_window("main") {
+                        if let Ok(ns_win_ptr) = win.ns_window() {
+                            let ns_win = ns_win_ptr as *mut AnyObject;
+                            unsafe {
+                                let _: () = msg_send![ns_win, setIgnoresMouseEvents: false];
+                            }
+                        }
+                    }
+                }
+                continue;
+            }
+
+            // In Ghost Mode: Check cursor position globally across screen
+            let (mouse_loc, frame, ns_win) = match app_handle.get_webview_window("main") {
+                Some(win) => {
+                    if let Ok(ns_win_ptr) = win.ns_window() {
+                        let ns_win = ns_win_ptr as *mut AnyObject;
+                        unsafe {
+                            if let Some(ns_event_cls) = AnyClass::get(c"NSEvent") {
+                                let loc: NSPoint = msg_send![ns_event_cls, mouseLocation];
+                                let f: NSRect = msg_send![ns_win, frame];
+                                (loc, f, ns_win)
+                            } else {
+                                continue;
+                            }
+                        }
+                    } else {
+                        continue;
+                    }
+                }
+                None => continue,
+            };
+
+            // Window bounds in Cocoa screen coordinates
+            let win_x = frame.origin.x;
+            let win_y = frame.origin.y;
+            let win_w = frame.size.width;
+            let win_h = frame.size.height;
+
+            let inside_win = mouse_loc.x >= win_x
+                && mouse_loc.x <= (win_x + win_w)
+                && mouse_loc.y >= win_y
+                && mouse_loc.y <= (win_y + win_h);
+
+            let mut inside_interactive = false;
+            if inside_win {
+                // Convert screen mouse location to webview CSS coordinates
+                let rel_x = mouse_loc.x - win_x;
+                let rel_y = win_h - (mouse_loc.y - win_y);
+
+                if let Ok(rects) = INTERACTIVE_RECTS.lock() {
+                    for r in rects.iter() {
+                        if rel_x >= (r.x - 10.0)
+                            && rel_x <= (r.x + r.width + 10.0)
+                            && rel_y >= (r.y - 10.0)
+                            && rel_y <= (r.y + r.height + 10.0)
+                        {
+                            inside_interactive = true;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            let should_ignore = !inside_interactive;
+            let was_ignoring = CURRENTLY_IGNORING.load(Ordering::Relaxed);
+
+            if should_ignore != was_ignoring {
+                CURRENTLY_IGNORING.store(should_ignore, Ordering::SeqCst);
+                unsafe {
+                    let _: () = msg_send![ns_win, setIgnoresMouseEvents: should_ignore];
+                }
+            }
+        }
+    });
 }
 
 #[cfg(target_os = "macos")]
@@ -187,10 +298,10 @@ fn set_interactive_rects(rects: Vec<InteractiveRect>) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn set_window_interactive(window: WebviewWindow, _interactive: bool) -> Result<(), String> {
+fn set_window_interactive(window: WebviewWindow, interactive: bool) -> Result<(), String> {
     #[cfg(not(target_os = "macos"))]
     {
-        let ignore = !_interactive;
+        let ignore = !interactive;
         let _ = window.set_ignore_cursor_events(ignore);
     }
 
@@ -198,10 +309,18 @@ fn set_window_interactive(window: WebviewWindow, _interactive: bool) -> Result<(
     {
         use objc2::msg_send;
         use objc2::runtime::AnyObject;
+
+        let ignore = if interactive {
+            false
+        } else {
+            IS_GHOST_MODE.load(Ordering::Relaxed)
+        };
+
+        CURRENTLY_IGNORING.store(ignore, Ordering::SeqCst);
         if let Ok(ns_win_ptr) = window.ns_window() {
             let ns_win = ns_win_ptr as *mut AnyObject;
             unsafe {
-                let _: () = msg_send![ns_win, setIgnoresMouseEvents: false];
+                let _: () = msg_send![ns_win, setIgnoresMouseEvents: ignore];
             }
         }
     }
@@ -219,10 +338,12 @@ fn set_click_through(window: WebviewWindow, ignore: bool) -> Result<(), String> 
     {
         use objc2::msg_send;
         use objc2::runtime::AnyObject;
+
+        CURRENTLY_IGNORING.store(ignore, Ordering::SeqCst);
         if let Ok(ns_win_ptr) = window.ns_window() {
             let ns_win = ns_win_ptr as *mut AnyObject;
             unsafe {
-                let _: () = msg_send![ns_win, setIgnoresMouseEvents: false];
+                let _: () = msg_send![ns_win, setIgnoresMouseEvents: ignore];
             }
         }
     }
@@ -337,7 +458,8 @@ pub fn run() {
             #[cfg(target_os = "macos")]
             {
                 app.set_activation_policy(tauri::ActivationPolicy::Regular);
-                setup_macos_dock_icon();
+                setup_macos_dock_and_process();
+                start_macos_mouse_monitor(app.handle().clone());
             }
 
             if let Some(window) = app.get_webview_window("main") {
@@ -366,11 +488,12 @@ pub fn run() {
             let ghost_i = MenuItem::with_id(app, "ghost", "Toggle Ghost Mode (⌘⇧X / ⌘⇧G)", true, None::<&str>)?;
             let sep1 = PredefinedMenuItem::separator(app)?;
             let clear_i = MenuItem::with_id(app, "clear", "Clear Screen Markups", true, None::<&str>)?;
+            let prefs_i = MenuItem::with_id(app, "prefs", "Preferences... (⌘,)", true, None::<&str>)?;
             let sep2 = PredefinedMenuItem::separator(app)?;
             let quit_i = MenuItem::with_id(app, "quit", "Quit PixelTrace", true, None::<&str>)?;
-            let menu = Menu::with_items(app, &[&toggle_i, &ghost_i, &sep1, &clear_i, &sep2, &quit_i])?;
+            let menu = Menu::with_items(app, &[&toggle_i, &ghost_i, &sep1, &clear_i, &prefs_i, &sep2, &quit_i])?;
 
-            let _tray = TrayIconBuilder::new()
+            let _tray = TrayIconBuilder::with_id("pixeltrace-tray")
                 .icon(app.default_window_icon().unwrap().clone())
                 .icon_as_template(false)
                 .menu(&menu)
@@ -385,6 +508,11 @@ pub fn run() {
                     "clear" => {
                         if let Some(win) = app.get_webview_window("main") {
                             let _ = win.emit("clear-canvas", ());
+                        }
+                    }
+                    "prefs" => {
+                        if let Some(win) = app.get_webview_window("main") {
+                            let _ = win.emit("open-preferences", ());
                         }
                     }
                     "quit" => {
