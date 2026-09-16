@@ -24,6 +24,7 @@
     GripVertical,
     Monitor,
     ChevronLeft,
+    ChevronRight,
     X
   } from "lucide-svelte";
 
@@ -63,6 +64,13 @@
     x: number;
     y: number;
     scale_factor: number;
+  }
+
+  interface InteractiveRect {
+    x: number;
+    y: number;
+    width: number;
+    height: number;
   }
 
   // Reactive application state
@@ -142,15 +150,18 @@
   let laserCursor = $state({ x: -100, y: -100, visible: false, isPressed: false });
   const LASER_LIFETIME_MS = 850;
 
-  // Floating Widget positioning & dragging
+  // Floating Widget positioning, snapping & edge docking
   let toolbarRef = $state<HTMLDivElement | null>(null);
+  let collapsedTabRef = $state<HTMLButtonElement | null>(null);
   let widgetX = $state(100);
   let widgetY = $state(20);
   let isDragging = false;
   let dragOffset = { x: 0, y: 0 };
   let isDocked = $state(false);
-  let dockEdge = $state<"left" | "right" | "top" | "bottom">("top");
+  let dockSide = $state<"left" | "right">("right");
   let isCollapsed = $state(false);
+  let lastFloatingX = $state(100);
+  let lastFloatingY = $state(20);
 
   // Stroke Size Presets
   const sizePresets = [
@@ -268,7 +279,7 @@
     }, 3200);
   }
 
-  // --- CONTINUOUS GLOWING LASER POINTER ENGINE ---
+  // --- CONTINUOUS GLOWING LASER POINTER ENGINE (BUTTERY SMOOTH SPLINE RIBBON) ---
   function renderLaserLoop(now: number) {
     if (!dynamicCtx) return;
 
@@ -280,68 +291,133 @@
       dynamicCtx.clearRect(0, 0, window.innerWidth, window.innerHeight);
     }
 
-    // Render continuous tapered glowing beam trail
-    if (laserPoints.length >= 2) {
+    const n = laserPoints.length;
+
+    // Render continuous tapered glowing beam ribbon
+    if (n >= 2) {
+      const rgb = hexToRgb(currentColor);
+
+      // Compute normal vectors and left/right polygon boundaries
+      const leftOuter: Point[] = [];
+      const rightOuter: Point[] = [];
+      const leftCore: Point[] = [];
+      const rightCore: Point[] = [];
+
+      for (let i = 0; i < n; i++) {
+        const p = laserPoints[i];
+        const age = now - p.time;
+        const progress = Math.max(0, Math.min(1, 1 - age / LASER_LIFETIME_MS));
+        const outerRadius = Math.max(1, (currentSize * 2.8 + 4) * Math.pow(progress, 1.15));
+        const coreRadius = Math.max(0.5, (currentSize * 1.2 + 2) * Math.pow(progress, 1.1));
+
+        let dx = 0;
+        let dy = 0;
+        if (i === 0) {
+          dx = laserPoints[1].x - laserPoints[0].x;
+          dy = laserPoints[1].y - laserPoints[0].y;
+        } else if (i === n - 1) {
+          dx = laserPoints[n - 1].x - laserPoints[n - 2].x;
+          dy = laserPoints[n - 1].y - laserPoints[n - 2].y;
+        } else {
+          dx = laserPoints[i + 1].x - laserPoints[i - 1].x;
+          dy = laserPoints[i + 1].y - laserPoints[i - 1].y;
+        }
+
+        const len = Math.hypot(dx, dy) || 1;
+        const nx = -dy / len;
+        const ny = dx / len;
+
+        leftOuter.push({ x: p.x + nx * outerRadius, y: p.y + ny * outerRadius });
+        rightOuter.push({ x: p.x - nx * outerRadius, y: p.y - ny * outerRadius });
+        leftCore.push({ x: p.x + nx * coreRadius, y: p.y + ny * coreRadius });
+        rightCore.push({ x: p.x - nx * coreRadius, y: p.y - ny * coreRadius });
+      }
+
+      const tailP = laserPoints[0];
+      const headP = laserPoints[n - 1];
+
+      // Pass 1: Wide Ambient Bloom Polygon Ribbon
       dynamicCtx.save();
+      dynamicCtx.beginPath();
+      dynamicCtx.moveTo(leftOuter[0].x, leftOuter[0].y);
+      for (let i = 0; i < n - 1; i++) {
+        const midX = (leftOuter[i].x + leftOuter[i + 1].x) / 2;
+        const midY = (leftOuter[i].y + leftOuter[i + 1].y) / 2;
+        dynamicCtx.quadraticCurveTo(leftOuter[i].x, leftOuter[i].y, midX, midY);
+      }
+      dynamicCtx.lineTo(headP.x, headP.y);
+      for (let i = n - 1; i > 0; i--) {
+        const midX = (rightOuter[i].x + rightOuter[i - 1].x) / 2;
+        const midY = (rightOuter[i].y + rightOuter[i - 1].y) / 2;
+        dynamicCtx.quadraticCurveTo(rightOuter[i].x, rightOuter[i].y, midX, midY);
+      }
+      dynamicCtx.lineTo(tailP.x, tailP.y);
+      dynamicCtx.closePath();
+
+      const bloomGrad = dynamicCtx.createLinearGradient(tailP.x, tailP.y, headP.x, headP.y);
+      bloomGrad.addColorStop(0, `rgba(${rgb}, 0.0)`);
+      bloomGrad.addColorStop(0.3, `rgba(${rgb}, 0.25)`);
+      bloomGrad.addColorStop(0.7, `rgba(${rgb}, 0.6)`);
+      bloomGrad.addColorStop(1, `rgba(${rgb}, 0.85)`);
+
+      dynamicCtx.fillStyle = bloomGrad;
+      dynamicCtx.shadowColor = currentColor;
+      dynamicCtx.shadowBlur = 18;
+      dynamicCtx.fill();
+      dynamicCtx.restore();
+
+      // Pass 2: Saturated Neon Core Ribbon
+      dynamicCtx.save();
+      dynamicCtx.beginPath();
+      dynamicCtx.moveTo(leftCore[0].x, leftCore[0].y);
+      for (let i = 0; i < n - 1; i++) {
+        const midX = (leftCore[i].x + leftCore[i + 1].x) / 2;
+        const midY = (leftCore[i].y + leftCore[i + 1].y) / 2;
+        dynamicCtx.quadraticCurveTo(leftCore[i].x, leftCore[i].y, midX, midY);
+      }
+      dynamicCtx.lineTo(headP.x, headP.y);
+      for (let i = n - 1; i > 0; i--) {
+        const midX = (rightCore[i].x + rightCore[i - 1].x) / 2;
+        const midY = (rightCore[i].y + rightCore[i - 1].y) / 2;
+        dynamicCtx.quadraticCurveTo(rightCore[i].x, rightCore[i].y, midX, midY);
+      }
+      dynamicCtx.lineTo(tailP.x, tailP.y);
+      dynamicCtx.closePath();
+
+      const coreGrad = dynamicCtx.createLinearGradient(tailP.x, tailP.y, headP.x, headP.y);
+      coreGrad.addColorStop(0, `rgba(${rgb}, 0.0)`);
+      coreGrad.addColorStop(0.35, `rgba(${rgb}, 0.5)`);
+      coreGrad.addColorStop(1, `rgba(${rgb}, 0.95)`);
+
+      dynamicCtx.fillStyle = coreGrad;
+      dynamicCtx.shadowColor = currentColor;
+      dynamicCtx.shadowBlur = 8;
+      dynamicCtx.fill();
+      dynamicCtx.restore();
+
+      // Pass 3: White-Hot Center Spine Spline
+      dynamicCtx.save();
+      dynamicCtx.beginPath();
+      dynamicCtx.moveTo(laserPoints[0].x, laserPoints[0].y);
+      for (let i = 0; i < n - 1; i++) {
+        const midX = (laserPoints[i].x + laserPoints[i + 1].x) / 2;
+        const midY = (laserPoints[i].y + laserPoints[i + 1].y) / 2;
+        dynamicCtx.quadraticCurveTo(laserPoints[i].x, laserPoints[i].y, midX, midY);
+      }
+      dynamicCtx.lineTo(headP.x, headP.y);
+
+      const spineGrad = dynamicCtx.createLinearGradient(tailP.x, tailP.y, headP.x, headP.y);
+      spineGrad.addColorStop(0, "rgba(255, 255, 255, 0.0)");
+      spineGrad.addColorStop(0.4, "rgba(255, 255, 255, 0.45)");
+      spineGrad.addColorStop(1, "rgba(255, 255, 255, 0.95)");
+
+      dynamicCtx.strokeStyle = spineGrad;
+      dynamicCtx.lineWidth = Math.max(1, currentSize * 0.45);
       dynamicCtx.lineCap = "round";
       dynamicCtx.lineJoin = "round";
-
-      // Pass 1: Wide Neon Bloom with progressive alpha decay
-      for (let i = 0; i < laserPoints.length - 1; i++) {
-        const p0 = laserPoints[i];
-        const p1 = laserPoints[i + 1];
-        const age = now - p1.time;
-        const progress = Math.max(0, Math.min(1, 1 - age / LASER_LIFETIME_MS));
-        const width = Math.max(2, (currentSize * 3.6 + 6) * Math.pow(progress, 1.2));
-        const alpha = Math.pow(progress, 0.8) * 0.45;
-
-        dynamicCtx.beginPath();
-        dynamicCtx.moveTo(p0.x, p0.y);
-        dynamicCtx.lineTo(p1.x, p1.y);
-        dynamicCtx.lineWidth = width;
-        dynamicCtx.strokeStyle = `rgba(${hexToRgb(currentColor)}, ${alpha})`;
-        dynamicCtx.shadowColor = currentColor;
-        dynamicCtx.shadowBlur = 16 * progress;
-        dynamicCtx.stroke();
-      }
-
-      // Pass 2: Saturated Neon Beam Core
-      for (let i = 0; i < laserPoints.length - 1; i++) {
-        const p0 = laserPoints[i];
-        const p1 = laserPoints[i + 1];
-        const age = now - p1.time;
-        const progress = Math.max(0, Math.min(1, 1 - age / LASER_LIFETIME_MS));
-        const width = Math.max(1.5, (currentSize * 1.6 + 2) * Math.pow(progress, 1.1));
-        const alpha = Math.pow(progress, 0.9) * 0.9;
-
-        dynamicCtx.beginPath();
-        dynamicCtx.moveTo(p0.x, p0.y);
-        dynamicCtx.lineTo(p1.x, p1.y);
-        dynamicCtx.lineWidth = width;
-        dynamicCtx.strokeStyle = `rgba(${hexToRgb(currentColor)}, ${alpha})`;
-        dynamicCtx.shadowColor = currentColor;
-        dynamicCtx.shadowBlur = 6 * progress;
-        dynamicCtx.stroke();
-      }
-
-      // Pass 3: White-Hot Center Spine
-      for (let i = 0; i < laserPoints.length - 1; i++) {
-        const p0 = laserPoints[i];
-        const p1 = laserPoints[i + 1];
-        const age = now - p1.time;
-        const progress = Math.max(0, Math.min(1, 1 - age / LASER_LIFETIME_MS));
-        const width = Math.max(1, (currentSize * 0.5 + 1) * Math.pow(progress, 1.3));
-        const alpha = Math.pow(progress, 1.1) * 0.95;
-
-        dynamicCtx.beginPath();
-        dynamicCtx.moveTo(p0.x, p0.y);
-        dynamicCtx.lineTo(p1.x, p1.y);
-        dynamicCtx.lineWidth = width;
-        dynamicCtx.strokeStyle = `rgba(255, 255, 255, ${alpha})`;
-        dynamicCtx.shadowBlur = 0;
-        dynamicCtx.stroke();
-      }
-
+      dynamicCtx.shadowColor = "#FFFFFF";
+      dynamicCtx.shadowBlur = 4;
+      dynamicCtx.stroke();
       dynamicCtx.restore();
     }
 
@@ -983,15 +1059,152 @@
     if (dynamicCtx) dynamicCtx.clearRect(0, 0, window.innerWidth, window.innerHeight);
   }
 
+  function updateInteractiveRects() {
+    const rects: InteractiveRect[] = [];
+
+    // Toolbar or Collapsed Tab rect
+    if (isCollapsed) {
+      const tabW = 56;
+      const tabH = 68;
+      const x = dockSide === "left" ? 0 : Math.max(0, window.innerWidth - tabW);
+      rects.push({ x, y: widgetY, width: tabW, height: tabH });
+    } else if (toolbarRef) {
+      rects.push({
+        x: widgetX,
+        y: widgetY,
+        width: toolbarRef.offsetWidth || 940,
+        height: toolbarRef.offsetHeight || 54
+      });
+    }
+
+    // Sticky notes rects
+    for (const note of stickyNotes) {
+      rects.push({
+        x: note.x,
+        y: note.y,
+        width: note.width,
+        height: note.isCollapsed ? 36 : note.height
+      });
+    }
+
+    // Shortcuts modal
+    if (showHelpModal) {
+      rects.push({
+        x: Math.max(0, (window.innerWidth - 420) / 2),
+        y: Math.max(0, (window.innerHeight - 400) / 2),
+        width: 420,
+        height: 400
+      });
+    }
+
+    // Inline text editing
+    if (isTextActive) {
+      rects.push({
+        x: textPos.x,
+        y: textPos.y - 28,
+        width: 340,
+        height: 52
+      });
+    }
+
+    invoke("set_interactive_rects", { rects }).catch(() => {});
+  }
+
+  function collapseToNearestEdge() {
+    const w = window.innerWidth;
+    const barWidth = toolbarRef ? toolbarRef.offsetWidth : 940;
+    const centerX = widgetX + barWidth / 2;
+
+    lastFloatingX = widgetX;
+    lastFloatingY = widgetY;
+
+    if (centerX < w / 2) {
+      dockSide = "left";
+      widgetX = 0;
+    } else {
+      dockSide = "right";
+      widgetX = Math.max(0, w - 56);
+    }
+
+    widgetY = Math.max(24, Math.min(window.innerHeight - 90, widgetY));
+    isCollapsed = true;
+    tick().then(updateInteractiveRects);
+  }
+
+  function expandFromEdge() {
+    const w = window.innerWidth;
+    const barWidth = toolbarRef ? toolbarRef.offsetWidth : 940;
+
+    isCollapsed = false;
+    widgetX = Math.max(16, Math.round((w - barWidth) / 2));
+    widgetY = 20;
+    tick().then(updateInteractiveRects);
+  }
+
+  function onMouseEnterInteractive() {
+    if (isGhostMode) {
+      invoke("set_window_interactive", { interactive: true }).catch(() => {});
+    }
+  }
+
+  function onMouseLeaveInteractive() {
+    if (isGhostMode) {
+      invoke("set_window_interactive", { interactive: false }).catch(() => {});
+    }
+  }
+
+  function onCollapsedTabDragStart(e: MouseEvent) {
+    isDragging = true;
+    dragOffset = {
+      x: e.clientX - widgetX,
+      y: e.clientY - widgetY
+    };
+    window.addEventListener("mousemove", onCollapsedTabDragMove);
+    window.addEventListener("mouseup", onCollapsedTabDragEnd);
+  }
+
+  function onCollapsedTabDragMove(e: MouseEvent) {
+    if (!isDragging) return;
+    const w = window.innerWidth;
+    const h = window.innerHeight;
+
+    widgetY = Math.max(16, Math.min(h - 84, e.clientY - dragOffset.y));
+
+    if (e.clientX < w / 2) {
+      dockSide = "left";
+      widgetX = 0;
+    } else {
+      dockSide = "right";
+      widgetX = Math.max(0, w - 56);
+    }
+    updateInteractiveRects();
+  }
+
+  function onCollapsedTabDragEnd() {
+    isDragging = false;
+    window.removeEventListener("mousemove", onCollapsedTabDragMove);
+    window.removeEventListener("mouseup", onCollapsedTabDragEnd);
+
+    const w = window.innerWidth;
+    if (dockSide === "left") {
+      widgetX = 0;
+    } else {
+      widgetX = Math.max(0, w - 56);
+    }
+    updateInteractiveRects();
+  }
+
   async function toggleGhostMode() {
     try {
       const newState = await invoke<boolean>("toggle_ghost_mode");
       isGhostMode = newState;
       triggerGhostToast(isGhostMode);
+      tick().then(updateInteractiveRects);
     } catch (err) {
       isGhostMode = !isGhostMode;
       await invoke("set_click_through", { ignore: isGhostMode });
       triggerGhostToast(isGhostMode);
+      tick().then(updateInteractiveRects);
     }
   }
 
@@ -1068,6 +1281,7 @@
     if (e.key === "Escape") {
       if (showHelpModal) {
         showHelpModal = false;
+        tick().then(updateInteractiveRects);
         return;
       }
       clearCanvas();
@@ -1093,7 +1307,11 @@
 
     if (e.key === " ") {
       e.preventDefault();
-      isCollapsed = !isCollapsed;
+      if (isCollapsed) {
+        expandFromEdge();
+      } else {
+        collapseToNearestEdge();
+      }
     }
   }
 
@@ -1112,6 +1330,7 @@
     if (!isDragging) return;
     widgetX = e.clientX - dragOffset.x;
     widgetY = e.clientY - dragOffset.y;
+    updateInteractiveRects();
   }
 
   function onDragEnd() {
@@ -1128,18 +1347,23 @@
     widgetY = Math.max(12, Math.min(h - barHeight - 12, widgetY));
 
     isDocked = widgetY <= 16;
+    updateInteractiveRects();
   }
 </script>
+
+<svelte:body class:ghost-active={isGhostMode} />
 
 <!-- Global Transparent Drawing Surfaces -->
 <canvas
   bind:this={staticCanvas}
   class="canvas-layer"
+  class:ghost-active={isGhostMode}
 ></canvas>
 
 <canvas
   bind:this={dynamicCanvas}
   class="canvas-layer tool-{currentTool}"
+  class:ghost-active={isGhostMode}
   onpointerdown={onPointerDown}
   onpointermove={onPointerMove}
   onpointerup={onPointerUp}
@@ -1151,6 +1375,10 @@
   <div
     class="inline-text-box"
     style="left: {textPos.x}px; top: {textPos.y - 24}px;"
+    role="region"
+    aria-label="Text Annotation Input"
+    onmouseenter={onMouseEnterInteractive}
+    onmouseleave={onMouseLeaveInteractive}
   >
     <input
       bind:this={textInputRef}
@@ -1176,6 +1404,10 @@
     class="sticky-note"
     class:collapsed={note.isCollapsed}
     style="left: {note.x}px; top: {note.y}px; width: {note.width}px; background-color: {note.color}; border-color: {note.borderColor}; color: {note.textColor};"
+    role="region"
+    aria-label="Sticky Note"
+    onmouseenter={onMouseEnterInteractive}
+    onmouseleave={onMouseLeaveInteractive}
   >
     <!-- Translucent Frosted Tape Pin at Top -->
     <div class="sticky-tape"></div>
@@ -1236,25 +1468,43 @@
   </div>
 {/each}
 
-<!-- Floating Centered Toolbar -->
+<!-- Floating Centered Toolbar & Edge Dock -->
 <div
   bind:this={toolbarRef}
   class="widget-container"
   class:docked={isDocked}
   class:collapsed={isCollapsed}
   style="transform: translate({widgetX}px, {widgetY}px);"
+  onmouseenter={onMouseEnterInteractive}
+  onmouseleave={onMouseLeaveInteractive}
   role="region"
   aria-label="PixelTrace Screen Toolbar"
 >
   {#if isCollapsed}
-    <!-- Collapsed Edge Pill -->
+    <!-- Docked Edge Tab (Half-Pill matching screenshot) -->
     <button
-      class="edge-pill"
-      onclick={() => (isCollapsed = false)}
-      title="Expand PixelTrace Toolbar (Space)"
+      bind:this={collapsedTabRef}
+      class="edge-dock-tab dock-{dockSide}"
+      onclick={expandFromEdge}
+      onmousedown={onCollapsedTabDragStart}
+      title="Click to expand PixelTrace (or drag along screen edge)"
+      aria-label="Expand PixelTrace Toolbar"
     >
-      <span class="pill-dot" style="background-color: {currentColor}"></span>
-      <span class="pill-text">PixelTrace</span>
+      {#if dockSide === "right"}
+        <div class="dock-chevron">
+          <ChevronLeft size={16} />
+        </div>
+        <div class="dock-logo-badge" style="background-color: {currentColor}">
+          <Sparkles size={14} color="#ffffff" />
+        </div>
+      {:else}
+        <div class="dock-logo-badge" style="background-color: {currentColor}">
+          <Sparkles size={14} color="#ffffff" />
+        </div>
+        <div class="dock-chevron">
+          <ChevronRight size={16} />
+        </div>
+      {/if}
     </button>
   {:else}
     <!-- Full Modern Glassmorphic Toolbar -->
@@ -1495,16 +1745,21 @@
         class="ghost-btn"
         class:active={isGhostMode}
         onclick={toggleGhostMode}
-        title="Ghost Mode (⌘⇧X / ⌘⇧G / X) — Pass clicks through to background apps"
+        title={isGhostMode ? "Ghost Mode Active — Click to return to Drawing Mode (⌘⇧X / ⌘⇧G / X)" : "Click to enable Ghost Mode (Click through to desktop apps)"}
       >
-        <Ghost size={15} />
-        <span class="ghost-label">{isGhostMode ? "Ghost" : "Draw"}</span>
+        <Ghost size={16} />
+        <div class="ghost-btn-text">
+          <span class="ghost-title">{isGhostMode ? "Ghost Active" : "Ghost"}</span>
+        </div>
       </button>
 
       <!-- Keyboard Shortcuts / Help Button -->
       <button
         class="icon-btn"
-        onclick={() => (showHelpModal = !showHelpModal)}
+        onclick={() => {
+          showHelpModal = !showHelpModal;
+          tick().then(updateInteractiveRects);
+        }}
         title="Keyboard Shortcuts & About"
       >
         <Keyboard size={16} />
@@ -1513,8 +1768,8 @@
       <!-- Collapse Button -->
       <button
         class="collapse-btn"
-        onclick={() => (isCollapsed = true)}
-        title="Collapse into edge pill (Space)"
+        onclick={collapseToNearestEdge}
+        title="Collapse & snap to screen edge (Space)"
       >
         <ChevronLeft size={16} />
       </button>
@@ -1529,6 +1784,8 @@
     role="dialog"
     aria-modal="true"
     tabindex="0"
+    onmouseenter={onMouseEnterInteractive}
+    onmouseleave={onMouseLeaveInteractive}
     onclick={(e) => {
       if (e.target === e.currentTarget) showHelpModal = false;
     }}
@@ -1621,6 +1878,10 @@
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
   }
 
+  :global(body.ghost-active) {
+    cursor: default !important;
+  }
+
   .canvas-layer {
     position: fixed;
     top: 0;
@@ -1629,6 +1890,11 @@
     height: 100vh;
     pointer-events: auto;
     z-index: 10;
+  }
+
+  .canvas-layer.ghost-active {
+    pointer-events: none !important;
+    cursor: default !important;
   }
 
   .canvas-layer.tool-laser,
@@ -1832,39 +2098,113 @@
     transition: transform 0.25s cubic-bezier(0.16, 1, 0.3, 1);
   }
 
-  /* Sleek Collapsed Pill */
-  .edge-pill {
+  /* Sleek Edge-Docked Half-Pill Tab matching screenshot & Apple HIG */
+  .edge-dock-tab {
     display: flex;
     align-items: center;
     gap: 8px;
-    padding: 8px 16px;
-    background: rgba(20, 20, 26, 0.92);
-    backdrop-filter: blur(24px);
-    -webkit-backdrop-filter: blur(24px);
+    padding: 10px 10px;
+    background: rgba(18, 18, 24, 0.88);
+    backdrop-filter: blur(28px) saturate(190%);
+    -webkit-backdrop-filter: blur(28px) saturate(190%);
     border: 1px solid rgba(255, 255, 255, 0.16);
-    border-radius: 24px;
     color: #ffffff;
-    cursor: pointer;
-    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
-    transition: transform 0.15s ease, background-color 0.15s;
+    cursor: grab;
+    box-shadow: 0 10px 30px rgba(0, 0, 0, 0.55), 0 0 1px rgba(255, 255, 255, 0.3);
+    transition: transform 0.18s cubic-bezier(0.16, 1, 0.3, 1), background-color 0.15s, border-color 0.15s;
+    user-select: none;
   }
 
-  .edge-pill:hover {
-    transform: scale(1.05);
-    background: rgba(28, 28, 36, 0.96);
+  .edge-dock-tab:active {
+    cursor: grabbing;
   }
 
-  .pill-dot {
-    width: 9px;
-    height: 9px;
+  .edge-dock-tab.dock-right {
+    border-top-left-radius: 32px;
+    border-bottom-left-radius: 32px;
+    border-top-right-radius: 0;
+    border-bottom-right-radius: 0;
+    border-right: none;
+    padding-left: 12px;
+    padding-right: 6px;
+  }
+
+  .edge-dock-tab.dock-left {
+    border-top-right-radius: 32px;
+    border-bottom-right-radius: 32px;
+    border-top-left-radius: 0;
+    border-bottom-left-radius: 0;
+    border-left: none;
+    padding-right: 12px;
+    padding-left: 6px;
+  }
+
+  .edge-dock-tab:hover {
+    background: rgba(28, 28, 38, 0.95);
+    border-color: rgba(255, 255, 255, 0.32);
+  }
+
+  .edge-dock-tab.dock-right:hover {
+    transform: translateX(-4px) scale(1.03);
+  }
+
+  .edge-dock-tab.dock-left:hover {
+    transform: translateX(4px) scale(1.03);
+  }
+
+  .dock-chevron {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: rgba(255, 255, 255, 0.85);
+  }
+
+  .dock-logo-badge {
+    width: 26px;
+    height: 26px;
     border-radius: 50%;
-    box-shadow: 0 0 10px currentColor;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    box-shadow: 0 0 12px currentColor;
   }
 
-  .pill-text {
-    font-size: 13px;
+  /* Ghost Mode Button */
+  .ghost-btn {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 5px 10px;
+    background: rgba(255, 255, 255, 0.07);
+    border: 1px solid rgba(255, 255, 255, 0.15);
+    border-radius: 9px;
+    color: #e0e0e0;
+    cursor: pointer;
+    transition: all 0.18s ease;
+  }
+
+  .ghost-btn:hover {
+    background: rgba(255, 255, 255, 0.15);
+    color: #ffffff;
+  }
+
+  .ghost-btn.active {
+    background: #af52de;
+    border-color: rgba(255, 255, 255, 0.4);
+    color: #ffffff;
+    box-shadow: 0 0 16px rgba(175, 82, 222, 0.75);
+  }
+
+  .ghost-btn-text {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    line-height: 1.1;
+  }
+
+  .ghost-title {
+    font-size: 11px;
     font-weight: 700;
-    letter-spacing: 0.4px;
   }
 
   /* Modern MarkerOn-Style Glassmorphic Bar */

@@ -1,4 +1,5 @@
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Mutex;
 use tauri::{
     menu::{Menu, MenuItem, PredefinedMenuItem},
     tray::TrayIconBuilder,
@@ -6,7 +7,69 @@ use tauri::{
 };
 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
 
+#[derive(serde::Deserialize, serde::Serialize, Clone, Copy, Debug)]
+pub struct InteractiveRect {
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+}
+
 static IS_GHOST_MODE: AtomicBool = AtomicBool::new(false);
+static INTERACTIVE_RECTS: Mutex<Vec<InteractiveRect>> = Mutex::new(Vec::new());
+
+#[cfg(target_os = "macos")]
+use objc2_foundation::{NSPoint, NSRect};
+
+#[cfg(target_os = "macos")]
+static ORIGINAL_HIT_TEST: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" fn custom_hit_test(
+    this: *mut objc2::runtime::AnyObject,
+    cmd: objc2::runtime::Sel,
+    point: NSPoint,
+) -> *mut objc2::runtime::AnyObject {
+    use objc2::msg_send;
+
+    let orig_ptr = ORIGINAL_HIT_TEST.load(Ordering::SeqCst);
+    if orig_ptr == 0 {
+        return std::ptr::null_mut();
+    }
+    let orig_fn: unsafe extern "C" fn(
+        *mut objc2::runtime::AnyObject,
+        objc2::runtime::Sel,
+        NSPoint,
+    ) -> *mut objc2::runtime::AnyObject = std::mem::transmute(orig_ptr);
+
+    let is_ghost = IS_GHOST_MODE.load(Ordering::SeqCst);
+    if !is_ghost {
+        return orig_fn(this, cmd, point);
+    }
+
+    let is_flipped: bool = msg_send![this, isFlipped];
+    let frame: NSRect = msg_send![this, frame];
+
+    let (x, y) = if is_flipped {
+        (point.x, point.y)
+    } else {
+        (point.x, frame.size.height - point.y)
+    };
+
+    let is_interactive = if let Ok(rects) = INTERACTIVE_RECTS.lock() {
+        rects.iter().any(|r| {
+            x >= r.x && x <= (r.x + r.width) && y >= r.y && y <= (r.y + r.height)
+        })
+    } else {
+        false
+    };
+
+    if is_interactive {
+        orig_fn(this, cmd, point)
+    } else {
+        std::ptr::null_mut()
+    }
+}
 
 #[derive(serde::Serialize)]
 struct MonitorInfo {
@@ -21,7 +84,15 @@ struct MonitorInfo {
 #[cfg(target_os = "macos")]
 fn setup_macos_window(window: &WebviewWindow) {
     use objc2::msg_send;
-    use objc2::runtime::{AnyClass, AnyObject};
+    use objc2::runtime::{AnyClass, AnyObject, Sel};
+    use std::os::raw::c_void;
+
+    extern "C" {
+        fn class_getInstanceMethod(cls: *const AnyClass, name: Sel) -> *mut c_void;
+        fn method_getImplementation(m: *mut c_void) -> *mut c_void;
+        fn method_setImplementation(m: *mut c_void, imp: *mut c_void) -> *mut c_void;
+        fn object_getClass(obj: *mut AnyObject) -> *const AnyClass;
+    }
 
     if let Ok(ns_win_ptr) = window.ns_window() {
         let ns_win = ns_win_ptr as *mut AnyObject;
@@ -42,6 +113,7 @@ fn setup_macos_window(window: &WebviewWindow) {
             let _: () = msg_send![ns_win, setOpaque: false];
             let _: () = msg_send![ns_win, setAcceptsMouseMovedEvents: true];
             let _: () = msg_send![ns_win, setTitlebarAppearsTransparent: true];
+            let _: () = msg_send![ns_win, setIgnoresMouseEvents: false];
 
             // Hide standard traffic-light buttons so window controls never drop down
             for button_id in 0..3isize {
@@ -55,14 +127,56 @@ fn setup_macos_window(window: &WebviewWindow) {
                 let clear_color: *mut AnyObject = msg_send![ns_color_cls, clearColor];
                 let _: () = msg_send![ns_win, setBackgroundColor: clear_color];
             }
+
+            // Swizzle hitTest: on contentView to allow selective click-through
+            let content_view: *mut AnyObject = msg_send![ns_win, contentView];
+            if !content_view.is_null() {
+                let cls = object_getClass(content_view);
+                if !cls.is_null() {
+                    let sel = Sel::register(c"hitTest:");
+                    let method = class_getInstanceMethod(cls, sel);
+                    if !method.is_null() && ORIGINAL_HIT_TEST.load(Ordering::SeqCst) == 0 {
+                        let original_imp = method_getImplementation(method);
+                        ORIGINAL_HIT_TEST.store(original_imp as usize, Ordering::SeqCst);
+                        method_setImplementation(method, custom_hit_test as *mut c_void);
+                    }
+                }
+            }
         }
     }
 }
 
 #[tauri::command]
+fn set_interactive_rects(rects: Vec<InteractiveRect>) -> Result<(), String> {
+    if let Ok(mut lock) = INTERACTIVE_RECTS.lock() {
+        *lock = rects;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn set_window_interactive(window: WebviewWindow, interactive: bool) -> Result<(), String> {
+    let ignore = !interactive;
+    let _ = window.set_ignore_cursor_events(ignore);
+
+    #[cfg(target_os = "macos")]
+    {
+        use objc2::msg_send;
+        use objc2::runtime::AnyObject;
+        if let Ok(ns_win_ptr) = window.ns_window() {
+            let ns_win = ns_win_ptr as *mut AnyObject;
+            unsafe {
+                let _: () = msg_send![ns_win, setIgnoresMouseEvents: ignore];
+            }
+        }
+    }
+    Ok(())
+}
+
+#[tauri::command]
 fn set_click_through(window: WebviewWindow, ignore: bool) -> Result<(), String> {
     IS_GHOST_MODE.store(ignore, Ordering::SeqCst);
-    window.set_ignore_cursor_events(ignore).map_err(|e| e.to_string())?;
+    let _ = window.set_ignore_cursor_events(ignore);
 
     #[cfg(target_os = "macos")]
     {
@@ -242,6 +356,8 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            set_interactive_rects,
+            set_window_interactive,
             set_click_through,
             toggle_ghost_mode,
             toggle_overlay,

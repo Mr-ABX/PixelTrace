@@ -11,3 +11,5 @@ vite.config.ts.timestamp-*
 src-tauri/target
 target/
 .npm-cache/
+scratch/
+

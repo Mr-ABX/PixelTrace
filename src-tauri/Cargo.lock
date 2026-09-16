@@ -3463,6 +3463,7 @@ name = "tauri-app"
 version = "0.1.0"
 dependencies = [
  "objc2",
+ "objc2-foundation",
  "serde",
  "serde_json",
  "tauri",
