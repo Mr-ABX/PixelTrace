@@ -137,6 +137,20 @@
   let showHelpModal = $state(false);
   let modalActiveTab = $state<"shortcuts" | "preferences" | "about">("shortcuts");
 
+  // OS & Dynamic Key Detection
+  let isMac = $state(true);
+  let modSymbol = $derived(isMac ? "⌘" : "Ctrl");
+  let superSymbol = $derived(isMac ? "⌘" : "Win");
+  let altSymbol = $derived(isMac ? "⌥" : "Alt");
+  let shiftSymbol = $derived(isMac ? "⇧" : "Shift");
+
+  // Customizable Hotkeys
+  let keyLaser = $state("1");
+  let keyPen = $state("2");
+  let keyHighlighter = $state("3");
+  let keyEraser = $state("0");
+  let keyGhost = $state("X");
+
   // Canvas references
   let staticCanvas: HTMLCanvasElement;
   let dynamicCanvas: HTMLCanvasElement;
@@ -203,6 +217,10 @@
     window.addEventListener("keydown", handleKeyDown);
     window.addEventListener("pointerdown", handleWindowClick);
 
+    if (typeof navigator !== "undefined") {
+      isMac = /Mac|iPod|iPhone|iPad/.test(navigator.platform || navigator.userAgent);
+    }
+
     try {
       const savedNotes = localStorage.getItem("pixeltrace_sticky_notes");
       if (savedNotes) {
@@ -218,6 +236,17 @@
       if (savedFade !== null) autoFadeEnabled = savedFade === "true";
       const savedLaserDur = localStorage.getItem("pixeltrace_pref_laser_duration");
       if (savedLaserDur) laserLifetimeMs = Number(savedLaserDur);
+
+      const kLaser = localStorage.getItem("pixeltrace_key_laser");
+      if (kLaser) keyLaser = kLaser;
+      const kPen = localStorage.getItem("pixeltrace_key_pen");
+      if (kPen) keyPen = kPen;
+      const kHighlighter = localStorage.getItem("pixeltrace_key_highlighter");
+      if (kHighlighter) keyHighlighter = kHighlighter;
+      const kEraser = localStorage.getItem("pixeltrace_key_eraser");
+      if (kEraser) keyEraser = kEraser;
+      const kGhost = localStorage.getItem("pixeltrace_key_ghost");
+      if (kGhost) keyGhost = kGhost;
     } catch (e) {
       console.warn("Could not load stored preferences:", e);
     }
@@ -1311,20 +1340,35 @@
   function captureSnapshot() {
     if (!staticCanvas) return;
     try {
-      staticCanvas.toBlob((blob) => {
+      const mergeCanvas = document.createElement("canvas");
+      mergeCanvas.width = staticCanvas.width;
+      mergeCanvas.height = staticCanvas.height;
+      const ctx = mergeCanvas.getContext("2d");
+      if (ctx) {
+        // Render static drawings
+        ctx.drawImage(staticCanvas, 0, 0);
+        // Render active dynamic strokes / laser pointer if present
+        if (dynamicCanvas) ctx.drawImage(dynamicCanvas, 0, 0);
+      }
+
+      mergeCanvas.toBlob(async (blob) => {
         if (blob) {
-          navigator.clipboard.write([new ClipboardItem({ "image/png": blob })])
-            .then(() => alert("Annotated screen markups copied to clipboard!"))
-            .catch(() => {
-              const a = document.createElement("a");
-              a.href = staticCanvas.toDataURL("image/png");
-              a.download = `pixeltrace-${Date.now()}.png`;
-              a.click();
-            });
+          try {
+            await navigator.clipboard.write([new ClipboardItem({ "image/png": blob })]);
+            triggerToast("✓ Screenshot copied to clipboard!");
+          } catch (e) {
+            // Fallback: download PNG file
+            const a = document.createElement("a");
+            a.href = mergeCanvas.toDataURL("image/png");
+            a.download = `pixeltrace-${Date.now()}.png`;
+            a.click();
+            triggerToast("✓ Screenshot saved to Downloads!");
+          }
         }
-      });
+      }, "image/png");
     } catch (e) {
       console.error("Snapshot error:", e);
+      triggerToast("⚠️ Screenshot capture failed");
     }
   }
 
@@ -1403,21 +1447,21 @@
       return;
     }
 
-    if (key === "x" || key === "g") {
+    if (key === keyGhost.toLowerCase() || key === "x" || key === "g") {
       toggleGhostMode();
       return;
     }
 
-    if (key === "l" || key === "1") currentTool = "laser";
-    if (key === "p" || key === "2") currentTool = "pen";
-    if (key === "h" || key === "3") currentTool = "highlighter";
+    if (key === keyLaser.toLowerCase() || key === "l" || key === "1") currentTool = "laser";
+    if (key === keyPen.toLowerCase() || key === "p" || key === "2") currentTool = "pen";
+    if (key === keyHighlighter.toLowerCase() || key === "h" || key === "3") currentTool = "highlighter";
     if (key === "a" || key === "4") currentTool = "arrow";
     if (key === "r" || key === "5") currentTool = "rect";
     if (key === "c" || key === "6") currentTool = "circle";
     if (key === "i" || key === "7") currentTool = "line";
     if (key === "s" || key === "8") currentTool = "stamp";
     if (key === "t" || key === "9") currentTool = "text";
-    if (key === "e" || key === "0") currentTool = "eraser";
+    if (key === keyEraser.toLowerCase() || key === "e" || key === "0") currentTool = "eraser";
     if (key === "n") currentTool = "sticky";
 
     if (e.key === " ") {
@@ -2115,18 +2159,18 @@
         {#if modalActiveTab === "shortcuts"}
           <div class="shortcuts-scrollable">
             <div class="shortcut-group">
-              <span class="group-title">Navigation & Modes</span>
+              <span class="group-title">Navigation & Modes ({isMac ? "macOS" : "Windows"})</span>
               <div class="shortcut-row">
                 <span>Toggle Overlay (Hide / Show)</span>
-                <kbd>⌘ + Shift + D</kbd>
+                <kbd>{superSymbol} + {shiftSymbol} + D</kbd>
               </div>
               <div class="shortcut-row">
                 <span>Toggle Ghost Mode (Click-Through)</span>
-                <kbd>⌘ + Shift + X / ⌘⇧G</kbd>
+                <kbd>{superSymbol} + {shiftSymbol} + X / {superSymbol}{shiftSymbol}G</kbd>
               </div>
               <div class="shortcut-row">
                 <span>Ghost Quick Toggle (when focused)</span>
-                <kbd>X / G</kbd>
+                <kbd>{keyGhost} / G</kbd>
               </div>
               <div class="shortcut-row">
                 <span>Collapse / Expand Toolbar</span>
@@ -2134,7 +2178,7 @@
               </div>
               <div class="shortcut-row">
                 <span>Open Preferences & Settings</span>
-                <kbd>⌘ + ,</kbd>
+                <kbd>{modSymbol} + ,</kbd>
               </div>
             </div>
 
@@ -2142,15 +2186,15 @@
               <span class="group-title">Drawing & Annotation Tools</span>
               <div class="shortcut-row">
                 <span>Laser Pointer (Continuous Glow)</span>
-                <kbd>1 / L</kbd>
+                <kbd>{keyLaser} / L</kbd>
               </div>
               <div class="shortcut-row">
                 <span>Pen / Marker</span>
-                <kbd>2 / P</kbd>
+                <kbd>{keyPen} / P</kbd>
               </div>
               <div class="shortcut-row">
                 <span>Translucent Highlighter</span>
-                <kbd>3 / H</kbd>
+                <kbd>{keyHighlighter} / H</kbd>
               </div>
               <div class="shortcut-row">
                 <span>Arrow Tool</span>
@@ -2174,7 +2218,7 @@
               </div>
               <div class="shortcut-row">
                 <span>Vector Eraser</span>
-                <kbd>0 / E</kbd>
+                <kbd>{keyEraser} / E</kbd>
               </div>
               <div class="shortcut-row">
                 <span>Desktop Sticky Note</span>
@@ -2186,11 +2230,11 @@
               <span class="group-title">Canvas Management</span>
               <div class="shortcut-row">
                 <span>Undo Last Action</span>
-                <kbd>⌘ + Z</kbd>
+                <kbd>{modSymbol} + Z</kbd>
               </div>
               <div class="shortcut-row">
                 <span>Redo Action</span>
-                <kbd>⌘ + Shift + Z / ⌘ + Y</kbd>
+                <kbd>{modSymbol} + {shiftSymbol} + Z / {modSymbol} + Y</kbd>
               </div>
               <div class="shortcut-row">
                 <span>Clear Screen Markups</span>
@@ -2240,6 +2284,63 @@
                 <option value="circle">Circle</option>
                 <option value="stamp">Stamp</option>
                 <option value="sticky">Sticky Note</option>
+              </select>
+            </div>
+
+            <div class="pref-card">
+              <div class="pref-info">
+                <span class="pref-label">Laser Key Selector</span>
+                <span class="pref-sub">Shortcut key to activate Laser Pointer tool</span>
+              </div>
+              <select
+                class="pref-select"
+                value={keyLaser}
+                onchange={(e) => {
+                  keyLaser = e.currentTarget.value;
+                  try { localStorage.setItem("pixeltrace_key_laser", keyLaser); } catch {}
+                }}
+              >
+                <option value="1">Key 1 (Default)</option>
+                <option value="L">Key L</option>
+                <option value="F1">F1 Key</option>
+              </select>
+            </div>
+
+            <div class="pref-card">
+              <div class="pref-info">
+                <span class="pref-label">Pen Tool Key Selector</span>
+                <span class="pref-sub">Shortcut key to activate Pen/Marker tool</span>
+              </div>
+              <select
+                class="pref-select"
+                value={keyPen}
+                onchange={(e) => {
+                  keyPen = e.currentTarget.value;
+                  try { localStorage.setItem("pixeltrace_key_pen", keyPen); } catch {}
+                }}
+              >
+                <option value="2">Key 2 (Default)</option>
+                <option value="P">Key P</option>
+                <option value="F2">F2 Key</option>
+              </select>
+            </div>
+
+            <div class="pref-card">
+              <div class="pref-info">
+                <span class="pref-label">Ghost Mode Key Selector</span>
+                <span class="pref-sub">Shortcut key for quick Ghost Passthrough mode</span>
+              </div>
+              <select
+                class="pref-select"
+                value={keyGhost}
+                onchange={(e) => {
+                  keyGhost = e.currentTarget.value;
+                  try { localStorage.setItem("pixeltrace_key_ghost", keyGhost); } catch {}
+                }}
+              >
+                <option value="X">Key X (Default)</option>
+                <option value="G">Key G</option>
+                <option value="F5">F5 Key</option>
               </select>
             </div>
 
